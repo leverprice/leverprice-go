@@ -1,0 +1,8 @@
+*.test
+*.out
+*.prof
+coverage.*
+/vendor/
+.idea/
+.vscode/
+.DS_Store
