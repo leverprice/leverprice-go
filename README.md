@@ -1,9 +1,11 @@
+<p>
 <a href="https://leverprice.com">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/leverprice/.github/main/assets/repo/go-dark.svg">
     <img alt="Leverprice SDK for Go" src="https://raw.githubusercontent.com/leverprice/.github/main/assets/repo/go-light.svg" width="100%">
   </picture>
 </a>
+</p>
 
 <p>
   <a href="https://pkg.go.dev/github.com/leverprice/leverprice-go"><img alt="Go reference" src="https://img.shields.io/badge/go.dev-reference-5B4CF5?style=flat-square&labelColor=0F1011"></a>
