@@ -8,10 +8,10 @@
 </p>
 
 <p>
-  <a href="https://pkg.go.dev/github.com/leverprice/leverprice-go"><img alt="Go reference" src="https://img.shields.io/badge/go.dev-reference-5B4CF5?style=flat-square&labelColor=0F1011"></a>
-  <a href="https://github.com/leverprice/leverprice-go/tags"><img alt="Version" src="https://img.shields.io/github/v/tag/leverprice/leverprice-go?label=version&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
+  <a href="https://pkg.go.dev/github.com/leverprice/leverprice-go"><img alt="Go reference" src="https://img.shields.io/badge/go.dev-reference-3C3F44?style=flat-square&labelColor=0F1011"></a>
+  <a href="https://github.com/leverprice/leverprice-go/tags"><img alt="Version" src="https://img.shields.io/github/v/tag/leverprice/leverprice-go?label=version&style=flat-square&labelColor=0F1011&color=3C3F44"></a>
   <a href="https://github.com/leverprice/leverprice-go/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/leverprice/leverprice-go/ci.yml?branch=main&label=ci&style=flat-square&labelColor=0F1011"></a>
-  <a href="https://github.com/leverprice/leverprice-go/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-5B4CF5?style=flat-square&labelColor=0F1011"></a>
+  <a href="https://github.com/leverprice/leverprice-go/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-3C3F44?style=flat-square&labelColor=0F1011"></a>
 </p>
 
 Server-side SDK for [Leverprice](https://leverprice.com) price experiments. Go 1.22+, standard library only.
