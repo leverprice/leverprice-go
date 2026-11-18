@@ -14,7 +14,47 @@ const (
 	maxRegions          = 300
 	maxSplits           = 300
 	maxScope            = 300
+	maxCountryHold      = 90 * 86_400
+	standardLevel       = 10_000 // the level of a country without a regional price
 )
+
+// Why a config was refused, sent back to the server in Leverprice-Config-Error.
+const (
+	codeMalformed    = "malformed"
+	codeUntrusted    = "untrusted"
+	codeBadSignature = "bad_signature"
+	codeExpired      = "expired"
+	codeWrongKey     = "wrong_key"
+	codeWrongProject = "wrong_project"
+	codeRollback     = "rollback"
+)
+
+// configError is a refused config and the code of the refusal.
+type configError struct {
+	code string
+	err  error
+}
+
+func (e *configError) Error() string { return e.err.Error() }
+func (e *configError) Unwrap() error { return e.err }
+
+// coded gives err the code of a refusal unless it already has one.
+func coded(code string, err error) error {
+	var ce *configError
+	if err == nil || errors.As(err, &ce) {
+		return err
+	}
+	return &configError{code: code, err: err}
+}
+
+// refusalCode returns the code of a refused config, or "" for any other error.
+func refusalCode(err error) string {
+	var ce *configError
+	if errors.As(err, &ce) {
+		return ce.code
+	}
+	return ""
+}
 
 type keyset struct {
 	version   int64
@@ -43,10 +83,13 @@ type experiment struct {
 }
 
 // region is one regional price of a product; index also selects each variant's regional price.
+// level is the price as basis points of the standard price (10000 = the same), to compare
+// countries.
 type region struct {
 	index    int
 	currency string
 	price    int64
+	level    int64
 }
 
 type configProduct struct {
@@ -68,6 +111,7 @@ type config struct {
 	key             []byte
 	keyFingerprints []string
 	countryHeader   string
+	countryHold     int64 // seconds a visitor keeps the price of a dearer country they were seen in; 0: off
 	products        map[string]*configProduct
 }
 
@@ -115,8 +159,12 @@ func parseConfig(payload string) (*config, []string, error) {
 		return nil, nil, errors.New("leverprice config: assignmentKey must be at least 32 bytes of base64url")
 	}
 	countryHeader, _ := jsonString(obj["countryHeader"])
-	if !isToken(countryHeader) {
+	if !isToken(countryHeader) || visitorSetHeader(countryHeader) {
 		countryHeader = ""
+	}
+	countryHold, ok := jsonSafeInt(obj["countryHold"])
+	if !ok || countryHold <= 0 || countryHold > maxCountryHold {
+		countryHold = 0
 	}
 	members, ok := jsonOrderedObject(obj["products"])
 	if !ok {
@@ -139,6 +187,7 @@ func parseConfig(payload string) (*config, []string, error) {
 		key:             key,
 		keyFingerprints: fingerprints,
 		countryHeader:   asciiLower(countryHeader),
+		countryHold:     countryHold,
 		products:        products,
 	}, dropped, nil
 }
@@ -210,7 +259,12 @@ func parseRegions(raw json.RawMessage) ([]region, map[string]int, bool) {
 		if !ok1 || !isCurrencyCode(currency) || !ok2 || price <= 0 {
 			return nil, nil, false
 		}
-		regions = append(regions, region{index: i, currency: asciiLower(currency), price: price})
+		// A level this SDK can't read compares as the standard price: it never holds a price.
+		level, ok := jsonSafeInt(r["level"])
+		if !ok || level <= 0 {
+			level = standardLevel
+		}
+		regions = append(regions, region{index: i, currency: asciiLower(currency), price: price, level: level})
 	}
 	return regions, regionOf, true
 }

@@ -12,8 +12,9 @@ import (
 )
 
 type flight struct {
-	done      chan struct{}
-	startedAt int64
+	done         chan struct{}
+	startedAt    int64
+	slowReported bool
 }
 
 func (c *Client) usableLocked(now int64) *config {
@@ -27,8 +28,8 @@ func (c *Client) usableLocked(now int64) *config {
 	return cfg
 }
 
-// currentConfig waits for a cold-start fetch at most Timeout after that fetch started, so
-// concurrent requests all give up at the same moment.
+// currentConfig waits for an in-flight fetch at most Timeout from this call: a fetch started
+// earlier (Preload, another request) must not shorten the wait.
 func (c *Client) currentConfig(ctx context.Context) *config {
 	now := c.nowMs()
 	c.mu.Lock()
@@ -43,12 +44,20 @@ func (c *Client) currentConfig(ctx context.Context) *config {
 	if f == nil {
 		return nil
 	}
-	if remaining := c.timeoutMs - (now - f.startedAt); remaining > 0 {
-		waitAtMost(ctx, f.done, time.Duration(remaining)*time.Millisecond)
+	if c.timeoutMs > 0 {
+		waitAtMost(ctx, f.done, time.Duration(c.timeoutMs)*time.Millisecond)
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.usableLocked(c.nowMs())
+	cfg := c.usableLocked(c.nowMs())
+	slow := cfg == nil && c.timeoutMs > 0 && ctx.Err() == nil && c.flight == f && !f.slowReported
+	if slow {
+		f.slowReported = true
+	}
+	c.mu.Unlock()
+	if slow {
+		c.report(fmt.Errorf("leverprice config: still loading after %d ms (Timeout); serving fallback prices until it arrives", c.timeoutMs))
+	}
+	return cfg
 }
 
 func (c *Client) kickLocked(now int64) {
@@ -128,14 +137,19 @@ func (c *Client) fetchConfig(unconditional bool) (note, err error) {
 			err = fmt.Errorf("leverprice: internal error: %v", r)
 		}
 	}()
+	// Tells the dashboard whether visitors get real prices: the products in code, and why the last
+	// config was refused.
+	headers := map[string]string{productsHeader: c.productsHeader}
 	c.mu.Lock()
 	etag := ""
 	// Revalidate only a config that is still usable; an expired or revoked one needs a new body.
 	if !unconditional && c.etag != "" && c.usableLocked(c.nowMs()) != nil {
 		etag = c.etag
 	}
+	if c.configError != "" {
+		headers[configErrorHeader] = c.configError
+	}
 	c.mu.Unlock()
-	headers := map[string]string{}
 	if etag != "" {
 		headers["If-None-Match"] = etag
 	}
@@ -152,11 +166,7 @@ func (c *Client) fetchConfig(unconditional bool) (note, err error) {
 		if !res.ok() {
 			return nil, fmt.Errorf("leverprice config: HTTP %d%s", res.status, errorCode(res.body))
 		}
-		body := stripBOM(res.body)
-		if !json.Valid(body) {
-			return nil, errors.New("leverprice config: response is not JSON")
-		}
-		if note, err = c.storeConfig(body, res.header.Get("ETag")); err != nil {
+		if _, note, err = c.storeConfig(stripBOM(res.body), res.header.Get("ETag")); err != nil {
 			return nil, err
 		}
 	}
@@ -164,16 +174,27 @@ func (c *Client) fetchConfig(unconditional bool) (note, err error) {
 	return note, nil
 }
 
-func (c *Client) storeConfig(body []byte, etag string) (note, err error) {
+// storeConfig handles the body of a 200 response: it stores an accepted config, and keeps the code
+// of a refused one for the next config request until a config is accepted.
+func (c *Client) storeConfig(body []byte, etag string) (dropped []string, note, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, note, err = c.acceptLocked(body, c.nowMs()); err != nil {
-		return nil, err
+	if !json.Valid(body) {
+		err = &configError{codeMalformed, errors.New("leverprice config: response is not JSON")}
+	} else {
+		dropped, note, err = c.acceptLocked(body, c.nowMs())
 	}
+	if err != nil {
+		if code := refusalCode(err); code != "" {
+			c.configError = code
+		}
+		return nil, nil, err
+	}
+	c.configError = ""
 	c.etag = etag
 	c.fetchedAt = c.nowMs()
 	c.failures, c.retryAt = 0, 0
-	return note, nil
+	return dropped, note, nil
 }
 
 func (c *Client) acceptLocked(envelope json.RawMessage, now int64) (dropped []string, note, err error) {
@@ -188,14 +209,16 @@ func (c *Client) acceptLocked(envelope json.RawMessage, now int64) (dropped []st
 		issued = issued || f == c.fingerprint
 	}
 	if !issued {
-		return nil, nil, errors.New("leverprice config: not issued for this API key; refusing")
+		return nil, nil, &configError{codeWrongKey, errors.New("leverprice config: not issued for this API key; refusing")}
 	}
 	current := c.config
 	if current != nil && cfg.projectID != current.projectID {
-		return nil, nil, fmt.Errorf("leverprice config: project changed from %s to %s; refusing", current.projectID, cfg.projectID)
+		return nil, nil, &configError{codeWrongProject,
+			fmt.Errorf("leverprice config: project changed from %s to %s; refusing", current.projectID, cfg.projectID)}
 	}
 	if current != nil && cfg.version < current.version {
-		return nil, nil, fmt.Errorf("leverprice config: refusing to roll back from version %d to %d", current.version, cfg.version)
+		return nil, nil, &configError{codeRollback,
+			fmt.Errorf("leverprice config: refusing to roll back from version %d to %d", current.version, cfg.version)}
 	}
 	if len(dropped) > 0 && (current == nil || cfg.version != current.version) {
 		note = fmt.Errorf("leverprice config v%d: ignored malformed products %s", cfg.version, strings.Join(dropped, ", "))

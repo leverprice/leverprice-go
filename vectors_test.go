@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"net/http"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func assignmentKey(t *testing.T) []byte {
@@ -53,9 +55,16 @@ func TestVectorTrust(t *testing.T) {
 				if step.Now != nil {
 					now = *step.Now
 				}
+				c.now = func() time.Time { return time.UnixMilli(now) }
+				dropped, _, err := c.storeConfig(step.Envelope, `"x"`)
 				c.mu.Lock()
-				dropped, _, err := c.acceptLocked(step.Envelope, now)
 				version := c.loadedVersionLocked()
+				countryHeader := ""
+				if c.config != nil {
+					countryHeader = c.config.countryHeader
+				}
+				// What the next config request reports in Leverprice-Config-Error.
+				refusal := c.configError
 				c.mu.Unlock()
 				switch step.Expect {
 				case "accept":
@@ -68,12 +77,27 @@ func TestVectorTrust(t *testing.T) {
 					if !reflect.DeepEqual(dropped, step.Dropped) {
 						t.Errorf("step %d: dropped %v, want %v", i, dropped, step.Dropped)
 					}
+					if step.CountryHeader != nil {
+						var want *string
+						if err := json.Unmarshal(step.CountryHeader, &want); err != nil {
+							t.Fatal(err)
+						}
+						if countryHeader != deref(want) {
+							t.Errorf("step %d: country header %q, want %q", i, countryHeader, deref(want))
+						}
+					}
+					if refusal != "" {
+						t.Errorf("step %d: still reports the refusal %q", i, refusal)
+					}
 				case "reject":
 					if err == nil {
 						t.Fatalf("step %d: accepted, want reject", i)
 					}
 					if !strings.HasPrefix(err.Error(), "leverprice") {
 						t.Errorf("step %d: error %q lacks the leverprice prefix", i, err)
+					}
+					if refusal != step.Code {
+						t.Errorf("step %d: refusal code %q, want %q (%v)", i, refusal, step.Code, err)
 					}
 				default:
 					t.Fatalf("step %d: unknown expectation %q", i, step.Expect)
@@ -423,4 +447,161 @@ func normalize(t *testing.T, v any) any {
 		t.Fatal(err)
 	}
 	return out
+}
+
+func TestVectorCountryHeaderNames(t *testing.T) {
+	for _, tc := range vectors(t).CountryHeaderNames {
+		if allowed := !visitorSetHeader(tc.Name); allowed != tc.Allowed {
+			t.Errorf("%q allowed = %v, want %v", tc.Name, allowed, tc.Allowed)
+		}
+	}
+}
+
+func TestVectorAddresses(t *testing.T) {
+	for _, tc := range vectors(t).Addresses {
+		value, isString := jsonString(tc.Value)
+		got, ok := normalizeAddress(value)
+		if !isString {
+			got, ok = "", false // Go takes only strings; anything else is no address
+		}
+		if want := deref(tc.Address); ok != (tc.Address != nil) || got != want {
+			t.Errorf("normalizeAddress(%s) = %q, %v; want %q", tc.Value, got, ok, want)
+		}
+	}
+	for _, tc := range vectors(t).ClientAddresses {
+		r, _ := http.NewRequest(http.MethodGet, "/", nil)
+		r.Header = headerOf(tc.Headers)
+		r.RemoteAddr = deref(tc.RemoteAddress)
+		got, ok := clientAddress(&PriceRequest{Request: r})
+		if want := deref(tc.Address); ok != (tc.Address != nil) || got != want {
+			t.Errorf("clientAddress(%v, %q) = %q, %v; want %q", tc.Headers, r.RemoteAddr, got, ok, want)
+		}
+		got, ok = clientAddress(&PriceRequest{Header: headerOf(tc.Headers)})
+		if tc.RemoteAddress == nil && (ok != (tc.Address != nil) || got != deref(tc.Address)) {
+			t.Errorf("clientAddress(%v) without a request = %q, %v; want %q", tc.Headers, got, ok, deref(tc.Address))
+		}
+	}
+}
+
+func TestVectorAnonVisitors(t *testing.T) {
+	key := assignmentKey(t)
+	for _, tc := range vectors(t).AnonVisitors {
+		msg := anonMessage(tc.Address, tc.UserAgent, tc.AcceptLanguage)
+		if msg != tc.Message {
+			t.Errorf("message %q, want %q", msg, tc.Message)
+		}
+		if got := hmacHex(key, msg, 32); got != tc.V {
+			t.Errorf("visitor key for %q = %s, want %s", msg, got, tc.V)
+		}
+	}
+}
+
+func TestVectorProductsHeader(t *testing.T) {
+	for _, tc := range vectors(t).ProductsHeader {
+		h := newHarness(t, func(o *Options) {
+			o.Products = map[string]ProductGuard{}
+			for k, g := range tc.Products {
+				o.Products[k] = ProductGuard(g)
+			}
+		})
+		h.api.setConfig(status(http.StatusServiceUnavailable, ""))
+		h.c.Refresh(context.Background())
+		calls := h.api.calls("/v1/config")
+		if len(calls) != 1 {
+			t.Fatalf("%d config requests, want 1", len(calls))
+		}
+		if got, sent := calls[0].header[productsHeader]; !sent || !slices.Equal(got, []string{tc.Header}) {
+			t.Errorf("Leverprice-Products %q (sent %v), want %q", got, sent, tc.Header)
+		}
+	}
+}
+
+func TestVectorCountryHold(t *testing.T) {
+	hold := vectors(t).CountryHold
+	key := assignmentKey(t)
+	for _, tc := range hold.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			h := newHarness(t, func(o *Options) {
+				o.Products = map[string]ProductGuard{}
+				for k, g := range hold.Guards {
+					o.Products[k] = ProductGuard(g)
+				}
+				o.LocalCurrencies = tc.LocalCurrencies
+			})
+			h.api.setConfig(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"v5"`)
+				_, _ = w.Write(hold.Config)
+			})
+			now := h.clock.Now().Unix()
+			header := http.Header{"User-Agent": {"Mozilla/5.0 Chrome/131.0"}}
+			if tc.Country != nil {
+				header.Set("X-Geo-Country", *tc.Country)
+			}
+			var signedAt *int64
+			if tc.Cookie != nil {
+				s := (&vectorState{V: hold.Visitor, A: tc.Cookie.A, X: tc.Cookie.X}).state()
+				if tc.Cookie.C != nil && tc.Cookie.Age != nil {
+					s.c, s.t = *tc.Cookie.C, now-*tc.Cookie.Age
+					signedAt = &s.t
+				}
+				header.Set("Cookie", "__pp="+signAssignment(key, s))
+			}
+			q := h.price(t, tc.ProductKey, PriceRequest{Header: header})
+			h.c.Flush(context.Background())
+
+			exposures := []map[string]any{}
+			for _, e := range h.api.sentEvents(t) {
+				delete(e, "timestamp")
+				delete(e, "visitorId")
+				exposures = append(exposures, e)
+			}
+			var cookie any
+			for _, set := range q.SetCookie {
+				value, isAssignment := strings.CutPrefix(set, "__pp=")
+				if !isAssignment {
+					continue
+				}
+				value, _, _ = strings.Cut(value, ";")
+				back := verifyAssignment(key, value)
+				if back == nil {
+					t.Fatalf("the quote's cookie does not verify: %s", set)
+				}
+				var held, since any
+				if back.c != "" {
+					held, since = back.c, "fresh"
+					if signedAt != nil && back.t == *signedAt {
+						since = "kept"
+					} else if back.t < now-5 || back.t > now+5 {
+						t.Errorf("hold stamped %d, now is %d", back.t, now)
+					}
+				}
+				pairs := [][2]string{}
+				for _, p := range back.a {
+					pairs = append(pairs, [2]string{p.experimentID, p.variantID})
+				}
+				cookie = map[string]any{"c": held, "t": since, "a": pairs}
+			}
+			got := map[string]any{
+				"price":     q.Price,
+				"currency":  q.Currency,
+				"country":   nullable(q.Country),
+				"regional":  q.Regional,
+				"reason":    q.Reason,
+				"variantId": nullable(q.VariantID),
+				"exposures": exposures,
+				"cookie":    cookie,
+			}
+			var want any
+			if err := json.Unmarshal(tc.Expect, &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(normalize(t, got), want) {
+				gj, _ := json.Marshal(got)
+				t.Errorf("quote\n got %s\nwant %s", gj, tc.Expect)
+			}
+			if errs := h.errs.all(); len(errs) != 0 {
+				t.Errorf("errors: %q", errs)
+			}
+		})
+	}
 }

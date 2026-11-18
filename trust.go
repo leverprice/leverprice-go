@@ -47,7 +47,7 @@ func (t *trustChain) isTrusted(k signingKey) bool {
 }
 
 func (t *trustChain) verify(envelope json.RawMessage, now int64) (*config, signingKey, []string, error) {
-	notSigned := errors.New("leverprice config: response is not a signed config")
+	notSigned := &configError{codeMalformed, errors.New("leverprice config: response is not a signed config")}
 	obj, ok := jsonObject(envelope)
 	if !ok {
 		return nil, signingKey{}, nil, notSigned
@@ -60,7 +60,7 @@ func (t *trustChain) verify(envelope json.RawMessage, now int64) (*config, signi
 	}
 	ks, err := t.verifyKeyset(obj["keyset"], now)
 	if err != nil {
-		return nil, signingKey{}, nil, err
+		return nil, signingKey{}, nil, coded(codeUntrusted, err)
 	}
 	var key *signingKey
 	for i := range ks.keys {
@@ -70,17 +70,19 @@ func (t *trustChain) verify(envelope json.RawMessage, now int64) (*config, signi
 		}
 	}
 	if key == nil {
-		return nil, signingKey{}, nil, fmt.Errorf("leverprice config: signing key %q is not in keyset v%d", keyID, ks.version)
+		return nil, signingKey{}, nil, &configError{codeBadSignature,
+			fmt.Errorf("leverprice config: signing key %q is not in keyset v%d", keyID, ks.version)}
 	}
 	if !ed25519Verify(key.publicKey, signature, payload) {
-		return nil, signingKey{}, nil, fmt.Errorf("leverprice config: bad signature (key %q)", keyID)
+		return nil, signingKey{}, nil, &configError{codeBadSignature, fmt.Errorf("leverprice config: bad signature (key %q)", keyID)}
 	}
 	cfg, dropped, err := parseConfig(payload)
 	if err != nil {
-		return nil, signingKey{}, nil, err
+		return nil, signingKey{}, nil, coded(codeMalformed, err)
 	}
 	if float64(now) >= cfg.expiresAt {
-		return nil, signingKey{}, nil, fmt.Errorf("leverprice config v%d: expired at %s", cfg.version, isoTime(cfg.expiresAt))
+		return nil, signingKey{}, nil, &configError{codeExpired,
+			fmt.Errorf("leverprice config v%d: expired at %s", cfg.version, isoTime(cfg.expiresAt))}
 	}
 	return cfg, *key, dropped, nil
 }

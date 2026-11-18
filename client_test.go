@@ -41,7 +41,6 @@ func TestColdStartTimeout(t *testing.T) {
 		}
 	})
 
-	start := time.Now()
 	var wg sync.WaitGroup
 	elapsed := make([]time.Duration, 8)
 	for i := range elapsed {
@@ -49,6 +48,7 @@ func TestColdStartTimeout(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			time.Sleep(time.Duration(i) * 5 * time.Millisecond)
+			start := time.Now()
 			q := h.price(t, "pro", browser(""))
 			if q.Reason != ReasonNoConfig || q.Price != 1900 || !q.IsFallback {
 				t.Errorf("quote %d: %s %d", i, q.Reason, q.Price)
@@ -59,8 +59,36 @@ func TestColdStartTimeout(t *testing.T) {
 	wg.Wait()
 	for i, d := range elapsed {
 		if d < 90*time.Millisecond || d > 400*time.Millisecond {
-			t.Errorf("quote %d returned after %v, want about 100ms after the fetch started", i, d)
+			t.Errorf("quote %d returned after %v, want about 100ms after its own call", i, d)
 		}
+	}
+	if n := len(h.api.calls("/v1/config")); n != 1 {
+		t.Errorf("%d config fetches, want 1", n)
+	}
+	want := []string{"leverprice config: still loading after 100 ms (Timeout); serving fallback prices until it arrives"}
+	if got := h.errs.all(); !reflect.DeepEqual(got, want) {
+		t.Errorf("errors %q, want %q", got, want)
+	}
+}
+
+func TestColdStartWaitIsNotShortenedByPreload(t *testing.T) {
+	release := make(chan struct{})
+	h := newHarness(t, func(o *Options) { o.Timeout = 400 * time.Millisecond })
+	h.c.now = time.Now
+	v := vectors(t)
+	h.api.setConfig(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		_, _ = w.Write(v.Config)
+	})
+	go h.c.Preload(context.Background()) // started at boot, not awaited
+	time.Sleep(250 * time.Millisecond)
+	// The config arrives 450ms after Preload started, 200ms into this request's own wait.
+	time.AfterFunc(200*time.Millisecond, func() { close(release) })
+	if q := h.price(t, "pro", browser("")); q.IsFallback {
+		t.Fatalf("got the fallback (%s) although the config arrived within this request's Timeout", q.Reason)
+	}
+	if got := h.errs.unexpected(); len(got) != 0 {
+		t.Errorf("errors %q", got)
 	}
 	if n := len(h.api.calls("/v1/config")); n != 1 {
 		t.Errorf("%d config fetches, want 1", n)
@@ -474,7 +502,7 @@ func TestRequestHeaders(t *testing.T) {
 		SDK map[string]string `json:"sdk"`
 	}
 	_ = json.Unmarshal(events.body, &body)
-	if !reflect.DeepEqual(body.SDK, map[string]string{"name": "leverprice-go", "version": "0.4.0"}) {
+	if !reflect.DeepEqual(body.SDK, map[string]string{"name": "leverprice-go", "version": "0.4.1"}) {
 		t.Errorf("sdk = %v", body.SDK)
 	}
 	if !q.ExposureLogged {
@@ -974,7 +1002,8 @@ func TestConfigRegions(t *testing.T) {
 		t.Errorf("product without regions: %+v", flat)
 	}
 	geo := cfg.products["geo"]
-	if want := []region{{0, "usd", 2000}, {1, "inr", 99_900}}; !slices.Equal(geo.regions, want) {
+	// No level in the config: it compares as the standard price, so it never holds a price.
+	if want := []region{{0, "usd", 2000, standardLevel}, {1, "inr", 99_900, standardLevel}}; !slices.Equal(geo.regions, want) {
 		t.Errorf("regions %+v, want %+v", geo.regions, want)
 	}
 	if want := map[string]int{"BR": 0, "MX": 0, "IN": 1}; !reflect.DeepEqual(geo.regionOf, want) {
@@ -1196,5 +1225,202 @@ func TestStickyAssignmentBeatsASplit(t *testing.T) {
 	req.Country = "IN"
 	if q := h.price(t, "split", req); q.VariantID != "var_s3" {
 		t.Errorf("new visitor from IN: %s, want var_s3", q.VariantID)
+	}
+}
+
+func TestCountryHeaderThatBrowsersSendIsIgnored(t *testing.T) {
+	for _, name := range []string{"Accept-Language", "x-forwarded-for", "X-Real-IP", "sec-ch-ua", "user-agent"} {
+		h := newHarness(t, func(o *Options) { o.CountryHeader = name })
+		if errs := h.errs.all(); len(errs) != 1 || !strings.Contains(errs[0], "sent by visitors' browsers") ||
+			!strings.Contains(errs[0], "it is ignored") {
+			t.Errorf("%s: errors %q, want one about the ignored header", name, errs)
+		}
+		q := h.price(t, "geo", PriceRequest{Header: http.Header{"User-Agent": {chrome}, name: {"IN"}}})
+		if q.Reason != ReasonBasePrice || q.Country != "" || q.Regional {
+			t.Errorf("%s: the visitor picked the country: %+v", name, q)
+		}
+		if errs := h.errs.unexpected(); len(errs) != 1 {
+			t.Errorf("%s: reported %d times: %q", name, len(errs), errs)
+		}
+	}
+	for _, name := range []string{"cf-ipcountry", "x-vercel-ip-country", "x-geo-country"} {
+		if errs := newHarness(t, func(o *Options) { o.CountryHeader = name }).errs.all(); len(errs) != 0 {
+			t.Errorf("%s: errors %q", name, errs)
+		}
+	}
+	if errs := newHarness(t, func(o *Options) { o.CountryHeader = "accept-language"; o.Disabled = true }).errs.all(); len(errs) != 0 {
+		t.Errorf("reported while disabled: %q", errs)
+	}
+	t.Setenv("LEVERPRICE_DISABLED", "1")
+	if errs := newHarness(t, func(o *Options) { o.CountryHeader = "accept-language" }).errs.all(); len(errs) != 0 {
+		t.Errorf("reported while LEVERPRICE_DISABLED is set: %q", errs)
+	}
+}
+
+func TestConfigRequestsNameTheProducts(t *testing.T) {
+	h := newHarness(t, func(o *Options) {
+		o.Products = map[string]ProductGuard{
+			"team":     {Currency: "EUR", FallbackPrice: 4900},
+			"pro plan": {Currency: "usd", FallbackPrice: 1900},
+			"été":      {Currency: "usd", FallbackPrice: 900},
+		}
+	})
+	full := newFakeAPI(t).config
+	h.api.setConfig(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") != "" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		full(w, r)
+	})
+	h.c.Preload(context.Background())
+	h.c.Refresh(context.Background())
+	h.api.setConfig(status(http.StatusServiceUnavailable, ""))
+	h.c.Refresh(context.Background())
+
+	calls := h.api.calls("/v1/config")
+	if len(calls) != 3 {
+		t.Fatalf("%d config requests, want 3 (200, 304, 503)", len(calls))
+	}
+	for i, r := range calls {
+		if got := r.header.Values(productsHeader); !slices.Equal(got, []string{"%C3%A9t%C3%A9=usd, pro%20plan=usd, team=eur"}) {
+			t.Errorf("request %d: Leverprice-Products %q", i, got)
+		}
+		// An outage is not a refused config.
+		if got := r.header.Values(configErrorHeader); len(got) != 0 {
+			t.Errorf("request %d: Leverprice-Config-Error %q", i, got)
+		}
+	}
+}
+
+func TestConfigRequestsSayWhyTheLastConfigWasRefused(t *testing.T) {
+	var refused json.RawMessage
+	for _, tc := range vectors(t).Trust {
+		for _, step := range tc.Steps {
+			if refused == nil && step.Expect == "reject" && step.Code == "bad_signature" {
+				refused = step.Envelope
+			}
+		}
+	}
+	h := newHarness(t)
+	full := newFakeAPI(t).config
+	responses := []http.HandlerFunc{
+		status(http.StatusOK, "not json"),
+		status(http.StatusServiceUnavailable, ""), // an HTTP error neither sets nor clears the code
+		status(http.StatusOK, `{"payload":"x"}`),
+		status(http.StatusOK, string(refused)),
+		full,
+		full,
+	}
+	for _, respond := range responses {
+		h.api.setConfig(respond)
+		h.c.Refresh(context.Background())
+	}
+	var sent []string
+	for _, r := range h.api.calls("/v1/config") {
+		sent = append(sent, strings.Join(r.header.Values(configErrorHeader), ","))
+	}
+	want := []string{"", "malformed", "malformed", "malformed", "bad_signature", ""}
+	if !slices.Equal(sent, want) {
+		t.Errorf("Leverprice-Config-Error sent %q, want %q", sent, want)
+	}
+}
+
+func TestVisitorWithoutCookiesKeepsOnePrice(t *testing.T) {
+	sources := map[string]func() PriceRequest{
+		"the connection's address": func() PriceRequest {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = "203.0.113.7:51234"
+			r.Header.Set("User-Agent", chrome)
+			r.Header.Set("Accept-Language", "en-US,en;q=0.9")
+			return PriceRequest{Request: r}
+		},
+		"an address header": func() PriceRequest {
+			return PriceRequest{Header: http.Header{"User-Agent": {chrome}, "X-Forwarded-For": {"2001:db8:1:2::7, 10.0.0.1"}}}
+		},
+	}
+	for name, request := range sources {
+		h := newHarness(t)
+		visitors := map[string]bool{}
+		for i := 0; i < 20; i++ {
+			q := h.price(t, "pro", request())
+			if q.Reason != ReasonExperiment || len(q.SetCookie) != 1 {
+				t.Fatalf("%s: request %d: %+v", name, i, q)
+			}
+			visitors[q.VisitorID+" "+q.VariantID] = true
+		}
+		h.c.Flush(context.Background())
+		if len(visitors) != 1 {
+			t.Errorf("%s: %d visitors for one browser without cookies, want 1", name, len(visitors))
+		}
+		if events := h.api.sentEvents(t); len(events) != 1 {
+			t.Errorf("%s: %d exposures, want 1", name, len(events))
+		}
+	}
+}
+
+func TestVisitorWithoutCookiesOrAddressIsNewEachTime(t *testing.T) {
+	h := newHarness(t)
+	visitors := map[string]bool{}
+	for i := 0; i < 20; i++ {
+		req := PriceRequest{Header: http.Header{"User-Agent": {chrome}}}
+		if i%2 == 1 {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = "unknown"
+			r.Header.Set("User-Agent", chrome)
+			req = PriceRequest{Request: r}
+		}
+		visitors[h.price(t, "pro", req).VisitorID] = true
+	}
+	h.c.Flush(context.Background())
+	if len(visitors) != 20 {
+		t.Errorf("%d visitors for 20 requests without a cookie or an address, want 20", len(visitors))
+	}
+	if events := h.api.sentEvents(t); len(events) != 20 {
+		t.Errorf("%d exposures, want 20", len(events))
+	}
+}
+
+func TestConfigCountryHoldAndLevels(t *testing.T) {
+	holds := map[string]int64{
+		``: 0, `"countryHold":null,`: 0, `"countryHold":0,`: 0, `"countryHold":-1,`: 0, `"countryHold":1.5,`: 0,
+		`"countryHold":"604800",`: 0, `"countryHold":7776001,`: 0, `"countryHold":1,`: 1,
+		`"countryHold":604800,`: 604_800, `"countryHold":7776000,`: 7_776_000,
+	}
+	for member, want := range holds {
+		payload := `{"schema":2,"projectId":"proj_1","version":1,"expiresAt":1,"keyFingerprints":[],"assignmentKey":"` +
+			vectors(t).AssignmentKey + `",` + member + `"products":{}}`
+		cfg, _, err := parseConfig(b64url([]byte(payload)))
+		if err != nil {
+			t.Errorf("config with %q rejected: %v", member, err)
+		} else if cfg.countryHold != want {
+			t.Errorf("config with %q: countryHold %d, want %d", member, cfg.countryHold, want)
+		}
+	}
+	levels := map[string]int64{``: 10_000, `,"level":null`: 10_000, `,"level":0`: 10_000, `,"level":-5`: 10_000,
+		`,"level":4138.5`: 10_000, `,"level":"4138"`: 10_000, `,"level":4138`: 4138, `,"level":12069`: 12_069}
+	for member, want := range levels {
+		payload := `{"schema":2,"projectId":"proj_1","version":1,"expiresAt":1,"keyFingerprints":[],"assignmentKey":"` +
+			vectors(t).AssignmentKey + `","products":{"geo":{"currency":"usd","price":2900,"minPrice":1000,` +
+			`"maxPrice":9900,"regions":[{"countries":["IN"],"currency":"usd","price":1200` + member + `}]}}}`
+		cfg, dropped, err := parseConfig(b64url([]byte(payload)))
+		if err != nil || len(dropped) != 0 {
+			t.Errorf("region with %q: dropped %v, %v", member, dropped, err)
+		} else if got := cfg.products["geo"].regions[0].level; got != want {
+			t.Errorf("region with %q: level %d, want %d", member, got, want)
+		}
+	}
+}
+
+func TestConfigNeverReadsTheCountryFromAHeaderBrowsersSend(t *testing.T) {
+	for _, name := range []string{"Accept-Language", "accept", "x-forwarded-for", "X-Real-IP", "sec-ch-ua-platform", "Forwarded"} {
+		payload := `{"schema":2,"projectId":"proj_1","version":1,"expiresAt":1,"keyFingerprints":[],"assignmentKey":"` +
+			vectors(t).AssignmentKey + `","countryHeader":"` + name + `","products":{}}`
+		cfg, _, err := parseConfig(b64url([]byte(payload)))
+		if err != nil {
+			t.Errorf("config naming %s rejected: %v", name, err)
+		} else if cfg.countryHeader != "" {
+			t.Errorf("config naming %s: the country is read from %q", name, cfg.countryHeader)
+		}
 	}
 }

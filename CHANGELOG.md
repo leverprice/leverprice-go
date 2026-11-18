@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file. The project follows
 [Semantic Versioning](https://semver.org).
 
+## 0.4.1 — 2026-11-18
+
+- Headers every browser sends (`Accept-Language`, `X-Forwarded-For`, `User-Agent`…) are never read
+  as the visitor's country. Named in `Options.CountryHeader`, such a header is ignored and reported
+  once through `OnError`; named in the project's settings, it is ignored too.
+- VPN guard: a visitor keeps the price of a dearer country they were seen in for 7 days, so a VPN
+  to a cheaper country does not lower it. The held country travels in the signed `__pp` cookie, so
+  a visitor on a product with regional prices gets that cookie even without a test.
+  `Quote.Country` is the country whose price applies.
+- Visitors who refuse cookies keep one price and count once: without a cookie, the visitor is keyed
+  by an HMAC of their IP address, browser and languages, made with your project's secret. Neither
+  the address nor the browser leaves your server. Without an address the key stays random.
+- Every config request names the products your code prices, and says why the last config was
+  refused until one is accepted, so the dashboard can show whether visitors get real prices.
+- Cookies stay compatible with 0.4.0 and 0.3: an older SDK drops the held country when it rewrites
+  the cookie, which only ends the hold early.
+- A cold start no longer gives up early: each request waits its own `Options.Timeout` for the
+  first config, even when `Preload` or another request started the fetch earlier. Before, a busy
+  server answered the first visitors with the fallback early, said nothing, and pinned them to it
+  for 30 minutes. A request that does give up now reports `leverprice config: still loading after
+  500 ms (Timeout); …` to `OnError`, once per fetch.
+
 ## 0.4.0 — 2026-11-18
 
 - Settings live in Leverprice, not in code: the product's price range and the header that carries

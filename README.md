@@ -191,6 +191,8 @@ Pass the incoming `*http.Request` (or just its `Header`). The SDK reads the `Coo
 
 Pricing several products for one page? Pass the **same `*http.Request`** to each `GetPrice` call: the quotes share one visitor cookie and the last quote's cookie carries every assignment. Sharing lasts until the request's context is done, which `net/http` does when the handler returns.
 
+A visitor who refuses cookies still keeps one price and counts once: without a cookie, the SDK keys the visitor by an HMAC of their IP address (an IPv6 address by its /64 network), browser and languages, made with your project's secret on your server. Neither the address nor the browser leaves your server. The address comes from `CF-Connecting-IP`, `True-Client-IP`, `Fastly-Client-IP`, `Fly-Client-IP`, `X-Real-IP`, `X-Forwarded-For` or the connection (`Request.RemoteAddr`).
+
 `ctx` bounds the cold-start wait together with `Timeout`; pass `r.Context()`.
 
 ## Regional prices
@@ -211,7 +213,8 @@ http.HandleFunc("/pricing", func(w http.ResponseWriter, r *http.Request) {
 })
 ```
 
-- **The country.** Name only a header your host or CDN sets and overwrites: a header a visitor can send themselves would let them pick their own price. To decide in code instead, set `CountryHeader` in `Options` (it replaces the project setting) or `Country` in `PriceRequest` (it wins over both). Fly.io sets no country header by default: there, set `Country` from your own lookup.
+- **The country.** Name only a header your host or CDN sets and overwrites: a header a visitor can send themselves would let them pick their own price. Headers every browser sends (`Accept-Language`, `X-Forwarded-For`, `User-Agent`…) are never read as the country: as `CountryHeader` they are ignored and reported to `OnError`. To decide in code instead, set `CountryHeader` in `Options` (it replaces the project setting) or `Country` in `PriceRequest` (it wins over both). Fly.io sets no country header by default: there, set `Country` from your own lookup.
+- **VPNs.** A visitor keeps the price of a country that pays more, where they were seen in the last 7 days: someone who saw $29 in the US and turns on a VPN to India still sees $29. A visitor who moves to a dearer country pays its price from then on. The country they hold is `q.Country`, and it travels in the signed `__pp` cookie, so a visitor on a regional product gets that cookie even without a test.
 - **Local currencies.** Regional prices in your product's currency ($12 in India instead of $29) need nothing in code. Prices in the visitor's own currency (₹999) are served only with `LocalCurrencies: true` in `Options`, which you set when your checkout charges `q.Price` in `q.Currency`; without it those visitors get the standard price, so a checkout with a fixed currency can never charge 99900 in dollars.
 - **Tests.** Each visitor still gets one sticky variant, at that variant's price for their country. A test can run in selected countries only, and countries can get their own share of traffic per price: both are set in the dashboard and need nothing from your code but the visitor's country.
 - **Checkout.** Always pass `q.Currency` with `q.Price`, also before you turn regional prices on: then they need no code change later. `CheckoutURL` is empty for a regional price: hosted checkout links are made for standard prices.
@@ -260,7 +263,7 @@ The config is revalidated every 30 s with an ETag. When any Leverprice response 
 | `ProductKey` | The key you asked for |
 | `Price` | Minor units; use it for display and as the checkout amount |
 | `Currency` | Lowercase ISO 4217: your product's currency, or the region's for a regional price |
-| `Country` | The visitor's country (ISO 3166-1 alpha-2) when known, else `""` |
+| `Country` | The country whose price applies (ISO 3166-1 alpha-2): the visitor's, or a dearer one they hold (see VPNs); `""` when unknown |
 | `Regional` | `Price` is the regional price of `Country` |
 | `IsFallback` | `Price` is your `FallbackPrice` |
 | `Reason` | See below |

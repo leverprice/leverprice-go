@@ -57,6 +57,9 @@ type vectorSet struct {
 			Expect   string          `json:"expect"`
 			Version  int64           `json:"version"`
 			Dropped  []string        `json:"dropped"`
+			Code     string          `json:"code"`
+			// The header the country is read from: absent (not checked), null (none) or a name.
+			CountryHeader json.RawMessage `json:"countryHeader"`
 		} `json:"steps"`
 	} `json:"trust"`
 	VisitorIDs []struct {
@@ -146,6 +149,48 @@ type vectorSet struct {
 		Errors          []string               `json:"errors"`
 		Expect          json.RawMessage        `json:"expect"`
 	} `json:"quotes"`
+	CountryHeaderNames []struct {
+		Name    string `json:"name"`
+		Allowed bool   `json:"allowed"`
+	} `json:"countryHeaderNames"`
+	Addresses []struct {
+		Value   json.RawMessage `json:"value"`
+		Address *string         `json:"address"`
+	} `json:"addresses"`
+	ClientAddresses []struct {
+		Headers       map[string]string `json:"headers"`
+		RemoteAddress *string           `json:"remoteAddress"`
+		Address       *string           `json:"address"`
+	} `json:"clientAddresses"`
+	AnonVisitors []struct {
+		Address        string `json:"address"`
+		UserAgent      string `json:"userAgent"`
+		AcceptLanguage string `json:"acceptLanguage"`
+		Message        string `json:"message"`
+		V              string `json:"v"`
+	} `json:"anonVisitors"`
+	ProductsHeader []struct {
+		Products map[string]vectorGuard `json:"products"`
+		Header   string                 `json:"header"`
+	} `json:"productsHeader"`
+	CountryHold struct {
+		Config  json.RawMessage        `json:"config"`
+		Guards  map[string]vectorGuard `json:"guards"`
+		Visitor string                 `json:"visitor"`
+		Cases   []struct {
+			Name       string  `json:"name"`
+			ProductKey string  `json:"productKey"`
+			Country    *string `json:"country"`
+			Cookie     *struct {
+				C   *string     `json:"c"`
+				Age *int64      `json:"age"`
+				A   [][2]string `json:"a"`
+				X   []string    `json:"x"`
+			} `json:"cookie"`
+			LocalCurrencies bool            `json:"localCurrencies"`
+			Expect          json.RawMessage `json:"expect"`
+		} `json:"cases"`
+	} `json:"countryHold"`
 }
 
 var (

@@ -18,10 +18,13 @@ type assignmentPair struct {
 }
 
 // assignmentState keeps assignments as ordered pairs: the cookie lists them most recent first.
+// c is the country whose price the visitor holds ("" for none) and t the second it was set.
 type assignmentState struct {
 	v string
 	a []assignmentPair
 	x []string
+	c string
+	t int64
 }
 
 func newAssignmentState(v string) *assignmentState {
@@ -33,6 +36,8 @@ func (s *assignmentState) clone() *assignmentState {
 		v: s.v,
 		a: append([]assignmentPair{}, s.a...),
 		x: append([]string{}, s.x...),
+		c: s.c,
+		t: s.t,
 	}
 }
 
@@ -113,7 +118,14 @@ func (s *assignmentState) json() string {
 		}
 		b = appendJSONString(b, id)
 	}
-	return string(append(b, "]}"...))
+	b = append(b, ']')
+	if s.c != "" {
+		b = append(b, `,"c":`...)
+		b = appendJSONString(b, s.c)
+		b = append(b, `,"t":`...)
+		b = strconv.AppendInt(b, s.t, 10)
+	}
+	return string(append(b, '}'))
 }
 
 func cookieTag(key []byte, body string) []byte {
@@ -176,6 +188,11 @@ func normalizeState(raw []byte) *assignmentState {
 				s.x = append(s.x, id)
 			}
 		}
+	}
+	country, ok1 := jsonString(obj["c"])
+	since, ok2 := jsonSafeInt(obj["t"])
+	if ok1 && isCountryCode(country) && ok2 && since >= 0 {
+		s.c, s.t = country, since
 	}
 	return s
 }

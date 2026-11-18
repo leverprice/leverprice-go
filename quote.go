@@ -27,7 +27,7 @@ type Quote struct {
 	ProductKey     string            `json:"productKey"`
 	Price          int64             `json:"price"`
 	Currency       string            `json:"currency"` // the product's currency, or the region's when Regional
-	Country        string            `json:"country"`  // the visitor's country (ISO 3166-1 alpha-2), when known
+	Country        string            `json:"country"`  // the country whose price applies (ISO 3166-1 alpha-2), when known: the visitor's, or a dearer one they were seen in lately (VPN guard)
 	Regional       bool              `json:"regional"` // Price is the regional price of Country
 	IsFallback     bool              `json:"isFallback"`
 	Reason         Reason            `json:"reason"`
