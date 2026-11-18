@@ -2,14 +2,14 @@
 //
 // A Client turns a product key and the incoming request into a Quote: the price to show and to
 // charge. Prices come only from a config signed through Leverprice's root → keyset → config key
-// chain and are always checked against the local guardrails in Options.Products. Whenever
-// Leverprice is off, slow, unreachable or misconfigured, GetPrice returns the product's
-// FallbackPrice instead of failing.
+// chain; standard and test prices stay inside the product's price range set in Leverprice, and
+// regional prices follow from them. Whenever Leverprice is off, slow, unreachable or
+// misconfigured, GetPrice returns the product's FallbackPrice instead of failing.
 //
 //	lp, err := leverprice.New(leverprice.Options{
 //		SecretKey: os.Getenv("LEVERPRICE_SECRET_KEY"),
 //		Products: map[string]leverprice.ProductGuard{
-//			"pro": {Currency: "usd", FallbackPrice: 1900, MinPrice: 1500, MaxPrice: 3900},
+//			"pro": {Currency: "usd", FallbackPrice: 1900},
 //		},
 //	})
 //	if err != nil {
@@ -30,6 +30,12 @@
 // Pass Quote.Metadata to the checkout and back to Client.TrackPurchase from the payment
 // webhook to attribute revenue to the experiment variant. Visitor and user ids leave the server
 // only as HMACs.
+//
+// Prices, price ranges, tests, regional prices and the header that carries the visitor's country
+// are managed in Leverprice and arrive in the signed config. Options.CountryHeader overrides the
+// project's country header and PriceRequest.Country wins over both. A regional Quote has Regional
+// set and carries the region's Currency, which differs from the product's only with
+// Options.LocalCurrencies.
 //
 // A Client is safe for concurrent use and starts no goroutine of its own until it is used; call
 // Close before the process exits to send queued events.

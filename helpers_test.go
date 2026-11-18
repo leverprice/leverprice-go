@@ -120,6 +120,10 @@ type vectorSet struct {
 		Domain *string `json:"domain"`
 		Header string  `json:"header"`
 	} `json:"setCookie"`
+	Countries []struct {
+		Value   string  `json:"value"`
+		Country *string `json:"country"`
+	} `json:"countries"`
 	Bots []struct {
 		UserAgent string `json:"userAgent"`
 		Bot       bool   `json:"bot"`
@@ -129,14 +133,18 @@ type vectorSet struct {
 		Valid bool            `json:"valid"`
 	} `json:"events"`
 	Quotes []struct {
-		Name       string                 `json:"name"`
-		ProductKey string                 `json:"productKey"`
-		Guards     map[string]vectorGuard `json:"guards"`
-		Headers    map[string]string      `json:"headers"`
-		UserID     *string                `json:"userId"`
-		Exposure   string                 `json:"exposure"`
-		Bot        *bool                  `json:"bot"`
-		Expect     json.RawMessage        `json:"expect"`
+		Name            string                 `json:"name"`
+		ProductKey      string                 `json:"productKey"`
+		Guards          map[string]vectorGuard `json:"guards"`
+		Headers         map[string]string      `json:"headers"`
+		UserID          *string                `json:"userId"`
+		Exposure        string                 `json:"exposure"`
+		Bot             *bool                  `json:"bot"`
+		CountryHeader   string                 `json:"countryHeader"`
+		LocalCurrencies bool                   `json:"localCurrencies"`
+		Country         *string                `json:"country"`
+		Errors          []string               `json:"errors"`
+		Expect          json.RawMessage        `json:"expect"`
 	} `json:"quotes"`
 }
 
@@ -188,12 +196,16 @@ func findVectors() (string, error) {
 
 func defaultGuards() map[string]ProductGuard {
 	return map[string]ProductGuard{
-		"pro":   {Currency: "usd", FallbackPrice: 1900, MinPrice: 1500, MaxPrice: 3900},
-		"basic": {Currency: "usd", FallbackPrice: 1000},
-		"euro":  {Currency: "eur", FallbackPrice: 1200, MinPrice: 100, MaxPrice: 5000},
-		"wild":  {Currency: "usd", FallbackPrice: 2000, MinPrice: 1000, MaxPrice: 3000},
-		"bad":   {Currency: "usd", FallbackPrice: 150},
-		"ghost": {Currency: "usd", FallbackPrice: 4900},
+		"pro":     {Currency: "usd", FallbackPrice: 1900},
+		"basic":   {Currency: "usd", FallbackPrice: 1000},
+		"euro":    {Currency: "eur", FallbackPrice: 1200},
+		"wild":    {Currency: "usd", FallbackPrice: 2000},
+		"bad":     {Currency: "usd", FallbackPrice: 150},
+		"ghost":   {Currency: "usd", FallbackPrice: 4900},
+		"geo":     {Currency: "usd", FallbackPrice: 2900},
+		"geox":    {Currency: "usd", FallbackPrice: 2900},
+		"badgeo":  {Currency: "usd", FallbackPrice: 2900},
+		"badgeox": {Currency: "usd", FallbackPrice: 2900},
 	}
 }
 

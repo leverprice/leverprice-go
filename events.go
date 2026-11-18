@@ -18,6 +18,8 @@ const (
 	ProviderPolar        Provider = "polar"
 	ProviderLemonSqueezy Provider = "lemonsqueezy"
 	ProviderDodo         Provider = "dodo"
+	ProviderPaddle       Provider = "paddle"
+	ProviderCreem        Provider = "creem"
 	ProviderOther        Provider = "other"
 )
 
@@ -125,7 +127,7 @@ func (c *Client) wasExposed(experimentID, visitorID string) bool {
 	return ok
 }
 
-func (c *Client) recordExposure(experimentID, variantID, visitorID string) bool {
+func (c *Client) recordExposure(experimentID, variantID, visitorID, country string) bool {
 	k := experimentID + ":" + visitorID
 	c.qmu.Lock()
 	if _, ok := c.exposed[k]; ok {
@@ -143,6 +145,7 @@ func (c *Client) recordExposure(experimentID, variantID, visitorID string) bool 
 		VariantID:    variantID,
 		VisitorID:    visitorID,
 		Timestamp:    c.nowMs(),
+		Country:      country,
 	})
 }
 

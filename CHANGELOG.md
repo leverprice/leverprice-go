@@ -3,7 +3,32 @@
 All notable changes to this project are documented in this file. The project follows
 [Semantic Versioning](https://semver.org).
 
-## 0.3.0 - 2026-11-17
+## 0.4.0 — 2026-11-18
+
+- Settings live in Leverprice, not in code: the product's price range and the header that carries
+  the visitor's country (Project settings → Visitor country) arrive in the signed config.
+  `MinPrice` and `MaxPrice` in code are no longer used; 0.3 code that sets them keeps compiling and
+  running.
+- Upgrading: limits set in code (`MinPrice`, `MaxPrice`) no longer hold prices. If they were tighter
+  than the product's range in Leverprice, tighten the range in the dashboard before you upgrade.
+- Regional prices: a product can cost something else in each country, in your currency or the
+  visitor's. `PriceRequest.Country`, `Country` / `Regional` on the quote, and an
+  `Options.CountryHeader` that overrides the project setting. Prices in the visitor's currency
+  need `Options.LocalCurrencies` (set it when your checkout charges `Quote.Currency`);
+  `Quote.Currency` is then the region's currency.
+- Exposures carry the visitor's country when it is known.
+- Tests by country: a test can run in selected countries only, and countries can be split between
+  the prices their own way. Both are set in the dashboard; the SDK only needs the visitor's country.
+- Cookies and the wire protocol are compatible with 0.3.
+- Turbo 8 hover prefetches (`X-Sec-Purpose: prefetch`) are priced but no longer counted as
+  exposures, like other prefetches.
+- README: the Stripe example uses the stripe-go v87 client (`stripe.NewClient`,
+  `V1CheckoutSessions.Create`). The webhook counts only paid Checkout Sessions, handles
+  `checkout.session.async_payment_succeeded`, reports a subscription's first payment by its
+  PaymentIntent id (as verified webhooks do) and skips $0 sessions.
+- `ProviderPaddle` and `ProviderCreem` for `TrackPurchase` and `TrackRefund`.
+
+## 0.3.0 — 2026-11-17
 
 First release of the Go SDK, at parity with the other Leverprice SDKs (protocol v2).
 

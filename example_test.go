@@ -16,7 +16,7 @@ func Example() {
 	lp, err := leverprice.New(leverprice.Options{
 		SecretKey: os.Getenv("LEVERPRICE_SECRET_KEY"),
 		Products: map[string]leverprice.ProductGuard{
-			"pro": {Currency: "usd", FallbackPrice: 1900, MinPrice: 1500, MaxPrice: 3900},
+			"pro": {Currency: "usd", FallbackPrice: 1900},
 		},
 	})
 	if err != nil {
@@ -34,6 +34,50 @@ func Example() {
 		q.WriteCookies(w)
 		_ = json.NewEncoder(w).Encode(map[string]any{"price": q.Price, "currency": q.Currency})
 	})
+}
+
+func Example_regionalPrices() {
+	lp, err := leverprice.New(leverprice.Options{
+		SecretKey:       os.Getenv("LEVERPRICE_SECRET_KEY"),
+		LocalCurrencies: true,
+		Products: map[string]leverprice.ProductGuard{
+			"pro": {Currency: "usd", FallbackPrice: 2900},
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer lp.Close(context.Background())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/pricing", func(w http.ResponseWriter, r *http.Request) {
+		q, err := lp.GetPrice(r.Context(), "pro", leverprice.PriceRequest{Request: r})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		q.WriteCookies(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"price":    q.Price,
+			"currency": q.Currency,
+			"country":  q.Country,
+			"regional": q.Regional,
+		})
+	})
+}
+
+func ExampleProductGuard() {
+	lp, err := leverprice.New(leverprice.Options{
+		SecretKey: os.Getenv("LEVERPRICE_SECRET_KEY"),
+		Products: map[string]leverprice.ProductGuard{
+			"pro":  {Currency: "usd", FallbackPrice: 2900},
+			"team": {Currency: "eur", FallbackPrice: 9900},
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer lp.Close(context.Background())
 }
 
 func ExampleClient_GetPrice() {

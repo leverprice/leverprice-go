@@ -133,6 +133,10 @@ func isLowerCurrencyCode(s string) bool {
 	return isCurrencyCode(s) && asciiLower(s) == s
 }
 
+func isCountryCode(s string) bool {
+	return len(s) == 2 && s[0] >= 'A' && s[0] <= 'Z' && s[1] >= 'A' && s[1] <= 'Z'
+}
+
 // isJSSpace is JavaScript's whitespace set, used by every SDK for trimming and URL checks.
 func isJSSpace(r rune) bool {
 	switch r {
@@ -143,6 +147,14 @@ func isJSSpace(r rune) bool {
 }
 
 func jsTrim(s string) string { return strings.TrimFunc(s, isJSSpace) }
+
+// trimASCIISpace strips space, tab, LF, VT, FF and CR only. Where a value selects a price or names
+// a header, U+00A0 and other Unicode whitespace must stay in place and fail validation.
+func trimASCIISpace(s string) string { return strings.Trim(s, " \t\n\v\f\r") }
+
+func isASCIILetter(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
 
 // asciiLower folds only A-Z: Unicode folding would also map "ſ" to "s" and "K" to "k".
 func asciiLower(s string) string {

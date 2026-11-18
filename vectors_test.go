@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -198,6 +199,14 @@ func TestVectorSetCookie(t *testing.T) {
 	}
 }
 
+func TestVectorCountries(t *testing.T) {
+	for _, tc := range vectors(t).Countries {
+		if got := normalizeCountry(tc.Value); got != deref(tc.Country) {
+			t.Errorf("normalizeCountry(%q) = %q, want %q", tc.Value, got, deref(tc.Country))
+		}
+	}
+}
+
 func TestVectorBots(t *testing.T) {
 	for _, tc := range vectors(t).Bots {
 		if got := IsBot(tc.UserAgent); got != tc.Bot {
@@ -256,6 +265,11 @@ func eventFromJSON(t *testing.T, raw json.RawMessage) (wireEvent, bool) {
 			VisitorID:    str(obj, "visitorId"),
 			Timestamp:    integer(obj, "timestamp"),
 		}
+		if raw, present := obj["country"]; present {
+			country, ok := jsonString(raw)
+			e.Country = country
+			fits = fits && ok && country != ""
+		}
 		return e, fits
 	case "purchase":
 		e := purchaseEvent{
@@ -295,6 +309,8 @@ func eventFromJSON(t *testing.T, raw json.RawMessage) (wireEvent, bool) {
 type quoteExpectation struct {
 	Price          int64             `json:"price"`
 	Currency       string            `json:"currency"`
+	Country        *string           `json:"country"`
+	Regional       bool              `json:"regional"`
 	IsFallback     bool              `json:"isFallback"`
 	Reason         Reason            `json:"reason"`
 	ExperimentID   *string           `json:"experimentId"`
@@ -325,8 +341,15 @@ func TestVectorQuotes(t *testing.T) {
 				for k, g := range tc.Guards {
 					o.Products[k] = ProductGuard(g)
 				}
+				o.CountryHeader = tc.CountryHeader
+				o.LocalCurrencies = tc.LocalCurrencies
 			})
-			req := PriceRequest{Header: headerOf(tc.Headers), UserID: deref(tc.UserID), Bot: tc.Bot}
+			req := PriceRequest{
+				Header:  headerOf(tc.Headers),
+				UserID:  deref(tc.UserID),
+				Country: deref(tc.Country),
+				Bot:     tc.Bot,
+			}
 			if tc.Exposure == "manual" {
 				req.Exposure = ExposureManual
 			}
@@ -336,6 +359,8 @@ func TestVectorQuotes(t *testing.T) {
 			got := quoteExpectation{
 				Price:          q.Price,
 				Currency:       q.Currency,
+				Country:        nullable(q.Country),
+				Regional:       q.Regional,
 				IsFallback:     q.IsFallback,
 				Reason:         q.Reason,
 				ExperimentID:   nullable(q.ExperimentID),
@@ -359,8 +384,8 @@ func TestVectorQuotes(t *testing.T) {
 			if q.ProductKey != tc.ProductKey {
 				t.Errorf("productKey = %q, want %q", q.ProductKey, tc.ProductKey)
 			}
-			if errs := h.errs.unexpected(); len(errs) > 0 {
-				t.Errorf("unexpected errors: %q", errs)
+			if errs := h.errs.unexpected(); !slices.Equal(errs, wantErrors(tc.Errors)) {
+				t.Errorf("errors\n got %q\nwant %q", errs, wantErrors(tc.Errors))
 			}
 			var asJSON, expected map[string]any
 			b, _ := json.Marshal(q)
@@ -373,6 +398,18 @@ func TestVectorQuotes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// wantErrors returns the vectors' messages as this package words them: with a lowercase prefix.
+func wantErrors(messages []string) []string {
+	out := make([]string, 0, len(messages))
+	for _, m := range messages {
+		if rest, ok := strings.CutPrefix(m, "Leverprice"); ok {
+			m = "leverprice" + rest
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 func normalize(t *testing.T, v any) any {

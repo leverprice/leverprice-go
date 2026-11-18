@@ -14,7 +14,7 @@ import (
 )
 
 // Version is the SDK version.
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // MinKeysetVersion is the lowest keyset version a new Client accepts.
 const MinKeysetVersion = 1
@@ -54,18 +54,22 @@ type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
-// ProductGuard holds the local guardrails for one product. Prices are in minor units.
+// ProductGuard holds a product's currency and fallback price. Prices are in minor units.
 type ProductGuard struct {
 	Currency      string // ISO 4217 code, e.g. "usd"
 	FallbackPrice int64  // served whenever Leverprice cannot price the product; must be positive
-	MinPrice      int64  // lowest price ever returned; 0 means 1
-	MaxPrice      int64  // highest price ever returned; 0 means 2^53-1
+
+	// Deprecated: ignored since 0.4; the price range is set in Leverprice.
+	MinPrice int64
+
+	// Deprecated: ignored since 0.4; the price range is set in Leverprice.
+	MaxPrice int64
 }
 
 // Options configure a Client. Zero values select the defaults.
 type Options struct {
 	SecretKey       string                  // pp_sk_live_… or pp_sk_test_…; missing or malformed disables the SDK
-	Products        map[string]ProductGuard // guardrails by product key
+	Products        map[string]ProductGuard // currency and fallback price by product key
 	Disabled        bool                    // kill switch; LEVERPRICE_DISABLED=1|true does the same
 	APIURL          string                  // default https://api.leverprice.com
 	Timeout         time.Duration           // cold-start wait for a config; default 500ms, negative for none
@@ -75,6 +79,8 @@ type Options struct {
 	CookieMaxAge    time.Duration           // assignment cookie lifetime; default 180 days
 	CookieSecure    *bool                   // Secure cookie attribute; default true
 	CookieDomain    string                  // Domain cookie attribute; default none
+	CountryHeader   string                  // trusted header with the visitor's country, e.g. "CF-IPCountry"; overrides the project's setting
+	LocalCurrencies bool                    // also serve regional prices in visitors' own currencies; set only if checkout charges Quote.Currency
 	FlushInterval   time.Duration           // longest time exposures wait before being sent; default 2s
 	TrustedRootKeys map[string]string       // root public keys by id; default RootPublicKeys()
 	HTTPClient      HTTPDoer                // default a plain *http.Client
@@ -97,6 +103,7 @@ type PriceRequest struct {
 	Cookie    string        // overrides the Cookie header; a value without "=" is the bare cookie value
 	UserAgent string        // overrides the User-Agent header
 	UserID    string        // stable signed-in user id; only its HMAC leaves the server
+	Country   string        // visitor's country (ISO 3166-1 alpha-2); wins over every country header
 	Exposure  ExposureMode
 	Bot       *bool // own bot verdict; skips the built-in user-agent check
 }
@@ -104,33 +111,33 @@ type PriceRequest struct {
 type guard struct {
 	currency      string
 	fallbackPrice int64
-	minPrice      int64
-	maxPrice      int64
 }
 
 // Client prices products and reports events. It is safe for concurrent use; create one per
 // process and share it.
 type Client struct {
-	secretKey     string
-	fingerprint   string
-	guards        map[string]guard
-	disabled      bool
-	apiURL        string
-	timeoutMs     int64
-	refreshMs     int64
-	maxStaleMs    int64
-	cookieName    string
-	cookieMaxAge  int64
-	cookieSecure  bool
-	cookieDomain  string
-	flushInterval time.Duration
-	httpClient    HTTPDoer
-	onError       func(error)
-	now           func() time.Time
-	sleep         func(time.Duration)
-	fetchCtx      context.Context
-	cancelFetches context.CancelFunc
-	closed        atomic.Bool
+	secretKey       string
+	fingerprint     string
+	guards          map[string]guard
+	disabled        bool
+	apiURL          string
+	timeoutMs       int64
+	refreshMs       int64
+	maxStaleMs      int64
+	cookieName      string
+	cookieMaxAge    int64
+	cookieSecure    bool
+	cookieDomain    string
+	countryHeader   string
+	localCurrencies bool
+	flushInterval   time.Duration
+	httpClient      HTTPDoer
+	onError         func(error)
+	now             func() time.Time
+	sleep           func(time.Duration)
+	fetchCtx        context.Context
+	cancelFetches   context.CancelFunc
+	closed          atomic.Bool
 
 	mu            sync.Mutex
 	trust         *trustChain
@@ -175,27 +182,33 @@ func New(opts Options) (*Client, error) {
 		return nil, err
 	}
 	cookieName := orDefault(opts.CookieName, defaultCookieName)
-	if !isCookieName(cookieName) {
+	if !isToken(cookieName) {
 		return nil, errors.New("leverprice: CookieName is not a valid cookie name")
 	}
+	countryHeader := trimASCIISpace(opts.CountryHeader)
+	if countryHeader != "" && !isToken(countryHeader) {
+		return nil, errors.New("leverprice: CountryHeader is not a valid header name")
+	}
 	c := &Client{
-		guards:        guards,
-		disabled:      opts.Disabled,
-		apiURL:        strings.TrimRight(orDefault(opts.APIURL, defaultAPIURL), "/"),
-		timeoutMs:     milliseconds(opts.Timeout, defaultTimeout),
-		refreshMs:     milliseconds(opts.RefreshInterval, defaultRefreshInterval),
-		maxStaleMs:    milliseconds(opts.MaxStale, defaultMaxStale),
-		cookieName:    cookieName,
-		cookieMaxAge:  int64(positive(opts.CookieMaxAge, defaultCookieMaxAge) / time.Second),
-		cookieSecure:  opts.CookieSecure == nil || *opts.CookieSecure,
-		cookieDomain:  opts.CookieDomain,
-		flushInterval: positive(opts.FlushInterval, defaultFlushInterval),
-		httpClient:    opts.HTTPClient,
-		onError:       opts.OnError,
-		now:           time.Now,
-		sleep:         time.Sleep,
-		exposed:       map[string]struct{}{},
-		scopes:        map[*http.Request]*scope{},
+		guards:          guards,
+		disabled:        opts.Disabled,
+		apiURL:          strings.TrimRight(orDefault(opts.APIURL, defaultAPIURL), "/"),
+		timeoutMs:       milliseconds(opts.Timeout, defaultTimeout),
+		refreshMs:       milliseconds(opts.RefreshInterval, defaultRefreshInterval),
+		maxStaleMs:      milliseconds(opts.MaxStale, defaultMaxStale),
+		cookieName:      cookieName,
+		cookieMaxAge:    int64(positive(opts.CookieMaxAge, defaultCookieMaxAge) / time.Second),
+		cookieSecure:    opts.CookieSecure == nil || *opts.CookieSecure,
+		cookieDomain:    opts.CookieDomain,
+		countryHeader:   asciiLower(countryHeader),
+		localCurrencies: opts.LocalCurrencies,
+		flushInterval:   positive(opts.FlushInterval, defaultFlushInterval),
+		httpClient:      opts.HTTPClient,
+		onError:         opts.OnError,
+		now:             time.Now,
+		sleep:           time.Sleep,
+		exposed:         map[string]struct{}{},
+		scopes:          map[*http.Request]*scope{},
 	}
 	if opts.Timeout < 0 {
 		c.timeoutMs = 0
@@ -230,17 +243,7 @@ func normalizeGuards(products map[string]ProductGuard) (map[string]guard, error)
 		if g.FallbackPrice <= 0 || g.FallbackPrice > maxSafeInteger {
 			return nil, fmt.Errorf("%s.FallbackPrice must be a positive integer (minor units)", where)
 		}
-		minPrice, maxPrice := g.MinPrice, g.MaxPrice
-		if minPrice == 0 {
-			minPrice = 1
-		}
-		if maxPrice == 0 {
-			maxPrice = maxSafeInteger
-		}
-		if minPrice < -maxSafeInteger || maxPrice > maxSafeInteger || minPrice > maxPrice {
-			return nil, fmt.Errorf("%s: MinPrice and MaxPrice must be at most 2^53-1 with MinPrice <= MaxPrice", where)
-		}
-		out[key] = guard{currency: asciiLower(g.Currency), fallbackPrice: g.FallbackPrice, minPrice: minPrice, maxPrice: maxPrice}
+		out[key] = guard{currency: asciiLower(g.Currency), fallbackPrice: g.FallbackPrice}
 	}
 	return out, nil
 }
@@ -261,7 +264,7 @@ func isSecretKey(k string) bool {
 	return true
 }
 
-func isCookieName(s string) bool {
+func isToken(s string) bool {
 	if s == "" {
 		return false
 	}
@@ -361,7 +364,7 @@ func (c *Client) quote(ctx context.Context, productKey string, g guard, pr *Pric
 			q = fail(fmt.Errorf("leverprice: internal error: %v", r))
 		}
 	}()
-	info := readRequest(pr, c.cookieName)
+	info := readRequest(pr, c.cookieName, c.countryHeader)
 	if pr.Bot != nil {
 		bot = *pr.Bot
 	} else {
@@ -380,32 +383,75 @@ func (c *Client) quote(ctx context.Context, productKey string, g guard, pr *Pric
 	if cfg == nil {
 		return c.noConfig(productKey, g, sc)
 	}
+	if pr.Country == "" && c.countryHeader == "" && cfg.countryHeader != "" {
+		info.country = headerCountry(requestHeader(pr), cfg.countryHeader)
+	}
 	p := cfg.products[productKey]
 	switch {
 	case p == nil:
 		return fallbackQuote(productKey, g, ReasonUnknownProduct)
 	case p.currency != g.currency:
 		return fallbackQuote(productKey, g, ReasonCurrencyMismatch)
-	case p.experiment == nil && inBounds(g, p, p.price):
-		return priceQuote(productKey, g, p.price, ReasonBasePrice, p.checkoutURL)
-	case p.experiment == nil || len(p.experiment.variants) == 0:
+	}
+	exp := experimentFor(p, info.country)
+	switch {
+	case exp == nil && inBounds(p, p.price):
+		if r := c.regionFor(g, p, info.country); r != nil {
+			q = regionalQuote(productKey, g, r)
+		} else {
+			q = priceQuote(productKey, g, p.price, ReasonBasePrice, p.checkoutURL)
+		}
+		q.Country = info.country
+		return q
+	case exp == nil || len(exp.variants) == 0:
 		return fallbackQuote(productKey, g, ReasonOutOfBounds)
 	}
-	for _, v := range p.experiment.variants {
-		if !inBounds(g, p, v.price) {
+	for _, v := range exp.variants {
+		if !inBounds(p, v.price) {
 			return fallbackQuote(productKey, g, ReasonOutOfBounds)
 		}
 	}
-	q, err := c.experimentQuote(productKey, g, pr, info, sc, cfg, p)
+	r := c.regionFor(g, p, info.country)
+	q, err := c.experimentQuote(productKey, g, pr, info, sc, cfg, p, exp, r)
 	if err != nil {
 		return fail(err)
 	}
 	return q
 }
 
+// experimentFor returns the test a visitor from country is in, or nil. A scoped test runs only
+// inside its scope: anyone else, an unknown country included, is priced as if there were no test.
+func experimentFor(p *configProduct, country string) *experiment {
+	exp := p.experiment
+	if exp == nil || exp.scope == nil {
+		return exp
+	}
+	if _, inScope := exp.scope[country]; country == "" || !inScope {
+		return nil
+	}
+	return exp
+}
+
+// regionFor returns the visitor's region when its price may be served: the product has one for the
+// country, in the guard's currency unless LocalCurrencies is set.
+func (c *Client) regionFor(g guard, p *configProduct, country string) *region {
+	if country == "" {
+		return nil
+	}
+	i, ok := p.regionOf[country]
+	if !ok {
+		return nil
+	}
+	r := &p.regions[i]
+	if r.currency != g.currency && !c.localCurrencies {
+		return nil
+	}
+	return r
+}
+
 func (c *Client) experimentQuote(productKey string, g guard, pr *PriceRequest, info requestInfo, sc *scope,
-	cfg *config, p *configProduct) (*Quote, error) {
-	exp, key := p.experiment, cfg.key
+	cfg *config, p *configProduct, exp *experiment, r *region) (*Quote, error) {
+	key := cfg.key
 
 	var state *assignmentState
 	if prior := sc.priorCookie(info.cookieInput, pr.UserID, cfg.assignmentKey); prior != nil {
@@ -447,18 +493,14 @@ func (c *Client) experimentQuote(productKey string, g guard, pr *PriceRequest, i
 		}
 	}
 	if chosen == nil {
-		weights := make([]float64, len(exp.variants))
-		for i, v := range exp.variants {
-			weights[i] = v.weight
-		}
-		chosen = &exp.variants[pickVariant(weights, bucketFor(exp.salt, visitorID))]
+		chosen = &exp.variants[pickVariant(exp.weightsFor(info.country), bucketFor(exp.salt, visitorID))]
 		state.assign(exp.id, chosen.id)
 		changed = true
 	}
 
 	logged := state.exposed(exp.id) || c.wasExposed(exp.id, visitorID)
 	if !logged && pr.Exposure == ExposureAuto && !info.prefetch {
-		c.recordExposure(exp.id, chosen.id, visitorID)
+		c.recordExposure(exp.id, chosen.id, visitorID, info.country)
 		logged = true
 	}
 	if logged && state.markExposed(exp.id) {
@@ -472,15 +514,20 @@ func (c *Client) experimentQuote(productKey string, g guard, pr *PriceRequest, i
 	if changed {
 		setCookie = append(setCookie, setCookieHeader(c.cookieName, signAssignment(key, state), c.cookieMaxAge, c.cookieSecure, c.cookieDomain))
 	}
-	checkoutURL := chosen.checkoutURL
+	price, currency, checkoutURL := chosen.price, g.currency, chosen.checkoutURL
 	if checkoutURL == "" {
 		checkoutURL = p.checkoutURL
+	}
+	if r != nil {
+		price, currency, checkoutURL = chosen.regional[r.index], r.currency, ""
 	}
 	signature := hmacHex(key, "pp:attr:v1:"+exp.id+":"+chosen.id+":"+visitorID, 16)
 	return &Quote{
 		ProductKey:   productKey,
-		Price:        chosen.price,
-		Currency:     g.currency,
+		Price:        price,
+		Currency:     currency,
+		Country:      info.country,
+		Regional:     r != nil,
 		Reason:       ReasonExperiment,
 		ExperimentID: exp.id,
 		VariantID:    chosen.id,
@@ -497,6 +544,19 @@ func (c *Client) experimentQuote(productKey string, g guard, pr *PriceRequest, i
 	}, nil
 }
 
+// weightsFor returns the weights that split the visitors from country between the variants: the
+// country's own when it has a split, else the variants'.
+func (e *experiment) weightsFor(country string) []float64 {
+	if weights, split := e.splitOf[country]; split && country != "" {
+		return weights
+	}
+	weights := make([]float64, len(e.variants))
+	for i, v := range e.variants {
+		weights[i] = v.weight
+	}
+	return weights
+}
+
 // priorCookie matches cookie input, user and key, so a request reused for many users shares nothing.
 func (sc *scope) priorCookie(input, userID, assignmentKey string) *assignmentState {
 	if sc == nil || sc.cookie == nil {
@@ -510,7 +570,7 @@ func (sc *scope) priorCookie(input, userID, assignmentKey string) *assignmentSta
 
 func (c *Client) botQuote(ctx context.Context, productKey string, g guard) *Quote {
 	if cfg := c.currentConfig(ctx); cfg != nil {
-		if p := cfg.products[productKey]; p != nil && p.currency == g.currency && inBounds(g, p, p.price) {
+		if p := cfg.products[productKey]; p != nil && p.currency == g.currency && inBounds(p, p.price) {
 			return priceQuote(productKey, g, p.price, ReasonBot, p.checkoutURL)
 		}
 	}
@@ -528,9 +588,9 @@ func (c *Client) pinCookie() string {
 	return setCookieHeader(c.cookieName+"_f", "1", pinMaxAgeSeconds, c.cookieSecure, c.cookieDomain)
 }
 
-func inBounds(g guard, p *configProduct, price int64) bool {
-	return price > 0 && price <= maxSafeInteger &&
-		price >= max(g.minPrice, p.minPrice) && price <= min(g.maxPrice, p.maxPrice)
+// inBounds reports whether a standard or test price is inside the product's signed price range.
+func inBounds(p *configProduct, price int64) bool {
+	return price > 0 && price <= maxSafeInteger && price >= p.minPrice && price <= p.maxPrice
 }
 
 // LogExposure logs the exposure of a quote obtained with ExposureManual once its price is
@@ -548,7 +608,7 @@ func (c *Client) LogExposure(q *Quote) (queued bool) {
 	if q.ExperimentID == "" || q.VariantID == "" || q.VisitorID == "" {
 		return false
 	}
-	queued = c.recordExposure(q.ExperimentID, q.VariantID, q.VisitorID)
+	queued = c.recordExposure(q.ExperimentID, q.VariantID, q.VisitorID, normalizeCountry(q.Country))
 	q.ExposureLogged = true
 	return queued
 }

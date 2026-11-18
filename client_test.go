@@ -5,10 +5,13 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -471,7 +474,7 @@ func TestRequestHeaders(t *testing.T) {
 		SDK map[string]string `json:"sdk"`
 	}
 	_ = json.Unmarshal(events.body, &body)
-	if !reflect.DeepEqual(body.SDK, map[string]string{"name": "leverprice-go", "version": "0.3.0"}) {
+	if !reflect.DeepEqual(body.SDK, map[string]string{"name": "leverprice-go", "version": "0.4.0"}) {
 		t.Errorf("sdk = %v", body.SDK)
 	}
 	if !q.ExposureLogged {
@@ -521,6 +524,75 @@ func TestManualExposure(t *testing.T) {
 	h.c.Flush(context.Background())
 	if events := h.api.sentEvents(t); len(events) != 1 || events[0]["variantId"] != "var_2" {
 		t.Errorf("events = %v", events)
+	}
+}
+
+func TestManualExposureSendsTheCountry(t *testing.T) {
+	h := newHarness(t, func(o *Options) {
+		o.CountryHeader = "CF-IPCountry"
+		o.LocalCurrencies = true
+	})
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("User-Agent", chrome)
+	r.Header.Set("CF-IPCountry", "IN")
+
+	q := h.price(t, "geox", PriceRequest{Request: r, Exposure: ExposureManual})
+	if q.Reason != ReasonExperiment || q.Country != "IN" || !q.Regional || q.Currency != "inr" || q.ExposureLogged {
+		t.Fatalf("manual quote: %+v", q)
+	}
+	h.c.Flush(context.Background())
+	if events := h.api.sentEvents(t); len(events) != 0 {
+		t.Fatalf("events before LogExposure: %v", events)
+	}
+	if !h.c.LogExposure(q) {
+		t.Fatal("LogExposure did not queue")
+	}
+
+	unknown := h.price(t, "geox", PriceRequest{UserAgent: chrome, UserID: "user_42", Exposure: ExposureManual})
+	if unknown.Country != "" || unknown.Regional || !h.c.LogExposure(unknown) {
+		t.Fatalf("manual quote without a country: %+v", unknown)
+	}
+
+	h.c.Flush(context.Background())
+	events := h.api.sentEvents(t)
+	if len(events) != 2 {
+		t.Fatalf("%d events: %v", len(events), events)
+	}
+	if events[0]["type"] != "exposure" || events[0]["visitorId"] != q.VisitorID || events[0]["country"] != "IN" {
+		t.Errorf("exposure of the quote from IN: %v", events[0])
+	}
+	if _, present := events[1]["country"]; present {
+		t.Errorf("exposure without a known country: %v", events[1])
+	}
+}
+
+func TestLogExposureNormalizesTheCountry(t *testing.T) {
+	h := newHarness(t)
+	cases := []struct{ visitorID, country, sent string }{
+		{"v1", " br ", "BR"},
+		{"v2", "\u00df", ""},
+		{"v3", "usa", ""},
+		{"v4", "", ""},
+	}
+	for _, tc := range cases {
+		q := &Quote{Reason: ReasonExperiment, ExperimentID: "exp_1", VariantID: "var_1", VisitorID: tc.visitorID, Country: tc.country}
+		if !h.c.LogExposure(q) || !q.ExposureLogged {
+			t.Errorf("country %q: exposure not logged", tc.country)
+		}
+	}
+	h.c.Flush(context.Background())
+	events := h.api.sentEvents(t)
+	if len(events) != len(cases) {
+		t.Fatalf("%d events: %v", len(events), events)
+	}
+	for i, tc := range cases {
+		country, present := events[i]["country"]
+		if events[i]["visitorId"] != tc.visitorID || present != (tc.sent != "") || (present && country != tc.sent) {
+			t.Errorf("country %q: sent %v", tc.country, events[i])
+		}
+	}
+	if errs := h.errs.all(); len(errs) != 0 {
+		t.Errorf("errors: %q", errs)
 	}
 }
 
@@ -581,8 +653,6 @@ func TestOptionsValidation(t *testing.T) {
 	cases := map[string]Options{
 		"currency":      {Products: map[string]ProductGuard{"p": {Currency: "us", FallbackPrice: 1}}},
 		"fallback":      {Products: map[string]ProductGuard{"p": {Currency: "usd"}}},
-		"bounds":        {Products: map[string]ProductGuard{"p": {Currency: "usd", FallbackPrice: 1, MinPrice: 10, MaxPrice: 5}}},
-		"unsafe max":    {Products: map[string]ProductGuard{"p": {Currency: "usd", FallbackPrice: 1, MaxPrice: 1 << 60}}},
 		"cookie name":   {CookieName: "bad name"},
 		"cookie name 2": {CookieName: "a;b"},
 	}
@@ -603,14 +673,35 @@ func TestOptionsValidation(t *testing.T) {
 	}
 }
 
+func TestCountryHeaderIsValidatedBeforeLowercasing(t *testing.T) {
+	for _, name := range []string{"bad name", "x:y", "\u212aey", "\u00a0cf-ipcountry", "cf-ipcountry\u2003"} {
+		_, err := New(Options{CountryHeader: name})
+		if err == nil || !strings.HasPrefix(err.Error(), "leverprice: ") || !strings.Contains(err.Error(), "CountryHeader") {
+			t.Errorf("CountryHeader %q: New returned %v, want an error about CountryHeader", name, err)
+		}
+	}
+	valid := map[string]string{"CF-IPCountry": "cf-ipcountry", " cf-ipcountry\n": "cf-ipcountry", "": "", "  ": ""}
+	for name, want := range valid {
+		c, err := New(Options{CountryHeader: name})
+		if err != nil {
+			t.Errorf("CountryHeader %q: %v", name, err)
+			continue
+		}
+		if c.countryHeader != want {
+			t.Errorf("CountryHeader %q read as %q, want %q", name, c.countryHeader, want)
+		}
+	}
+}
+
 func TestQuoteJSON(t *testing.T) {
 	q := fallbackQuote("pro", guard{currency: "usd", fallbackPrice: 1900}, ReasonNoConfig)
 	b, err := json.Marshal(q)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"productKey":"pro","price":1900,"currency":"usd","isFallback":true,"reason":"no_config",` +
-		`"experimentId":null,"variantId":null,"visitorId":null,"metadata":{},"setCookie":[],"checkoutUrl":null,"exposureLogged":false}`
+	want := `{"productKey":"pro","price":1900,"currency":"usd","country":null,"regional":false,"isFallback":true,` +
+		`"reason":"no_config","experimentId":null,"variantId":null,"visitorId":null,"metadata":{},"setCookie":[],` +
+		`"checkoutUrl":null,"exposureLogged":false}`
 	if string(b) != want {
 		t.Errorf("JSON\n got %s\nwant %s", b, want)
 	}
@@ -672,5 +763,438 @@ func TestHeaderValue(t *testing.T) {
 	}
 	if _, ok := headerValue(nil, "cookie"); ok {
 		t.Error("nil header has a value")
+	}
+}
+
+func TestCountrySource(t *testing.T) {
+	header := http.Header{"Cf-Ipcountry": {"br"}, "X-Country": {"IN", "DE"}, "X-GEO": {"mx"}, "x-\u212aountry": {"IN"}}
+	cases := []struct {
+		name          string
+		countryHeader string
+		country       string
+		want          string
+	}{
+		{"no source", "", "", ""},
+		{"the header named in the options", "cf-ipcountry", "", "BR"},
+		{"a header stored under an uppercase name", "x-geo", "", "MX"},
+		{"an explicit country wins", "cf-ipcountry", " de ", "DE"},
+		{"an invalid explicit country is not replaced by the header", "cf-ipcountry", "Germany", ""},
+		{"a digit is not a letter", "", "1n", ""},
+		{"a repeated header is no country", "x-country", "", ""},
+		{"a missing header", "x-missing", "", ""},
+		{"a header name is matched in ASCII only", "x-kountry", "", ""},
+	}
+	for _, tc := range cases {
+		info := readRequest(&PriceRequest{Header: header, Country: tc.country}, "__pp", tc.countryHeader)
+		if info.country != tc.want {
+			t.Errorf("%s: country %q, want %q", tc.name, info.country, tc.want)
+		}
+	}
+}
+
+func TestCountryHeaderOptionReplacesTheProjectSetting(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("User-Agent", chrome)
+	r.Header.Set("CF-IPCountry", "BR")
+	r.Header.Set("X-Geo-Country", "IN")
+	cases := []struct {
+		name          string
+		countryHeader string
+		country       string
+		want          string
+	}{
+		{"the project's header", "", "", "IN"},
+		{"the option's header", "CF-IPCountry", "", "BR"},
+		{"the option's header missing from the request", "X-Country", "", ""},
+		{"a country passed in", "CF-IPCountry", "MX", "MX"},
+	}
+	for _, tc := range cases {
+		h := newHarness(t, func(o *Options) { o.CountryHeader = tc.countryHeader })
+		q := h.price(t, "geox", PriceRequest{Request: r, Country: tc.country})
+		h.c.Flush(context.Background())
+		events := h.api.sentEvents(t)
+		if q.Reason != ReasonExperiment || q.Country != tc.want || len(events) != 1 {
+			t.Errorf("%s: %+v, exposures %v", tc.name, q, events)
+			continue
+		}
+		if country, _ := events[0]["country"].(string); country != tc.want {
+			t.Errorf("%s: exposure from %q, want %q", tc.name, country, tc.want)
+		}
+	}
+}
+
+func TestRegionalOptionsAreNormalized(t *testing.T) {
+	h := newHarness(t, func(o *Options) {
+		o.CountryHeader = " CF-IPCountry "
+		o.LocalCurrencies = true
+	})
+	q := h.price(t, "geo", PriceRequest{Header: http.Header{"User-Agent": {chrome}, "cf-ipcountry": {" in "}}})
+	if q.Reason != ReasonBasePrice || q.Price != 99_900 || q.Currency != "inr" || q.Country != "IN" || !q.Regional ||
+		q.IsFallback || q.CheckoutURL != "" {
+		t.Fatalf("regional quote: %+v", q)
+	}
+	if errs := h.errs.unexpected(); len(errs) > 0 {
+		t.Errorf("errors: %q", errs)
+	}
+}
+
+func TestLocalCurrencies(t *testing.T) {
+	cases := []struct {
+		country  string
+		local    bool
+		price    int64
+		currency string
+		regional bool
+	}{
+		{"IN", false, 2900, "usd", false},
+		{"IN", true, 99_900, "inr", true},
+		{"BR", false, 2000, "usd", true},
+		{"BR", true, 2000, "usd", true},
+	}
+	for _, tc := range cases {
+		h := newHarness(t, func(o *Options) { o.LocalCurrencies = tc.local })
+		q := h.price(t, "geo", PriceRequest{UserAgent: chrome, Country: tc.country})
+		if q.IsFallback || q.Price != tc.price || q.Currency != tc.currency || q.Regional != tc.regional || q.Country != tc.country {
+			t.Errorf("%s with LocalCurrencies %v: %+v", tc.country, tc.local, q)
+		}
+		if errs := h.errs.unexpected(); len(errs) > 0 {
+			t.Errorf("%s with LocalCurrencies %v: errors %q", tc.country, tc.local, errs)
+		}
+	}
+}
+
+func TestMinPriceAndMaxPriceAreIgnored(t *testing.T) {
+	inTest := func(experimentID, variantID, country string) PriceRequest {
+		state := vectorState{V: returningVisitor.V, A: [][2]string{{experimentID, variantID}}, X: []string{experimentID}}
+		req := browser("__pp=" + cookieFor(t, state))
+		req.Country = country
+		return req
+	}
+	from := func(country string) PriceRequest { return PriceRequest{UserAgent: chrome, Country: country} }
+	quotes := []struct {
+		productKey string
+		req        PriceRequest
+		reason     Reason
+		price      int64
+		currency   string
+		regional   bool
+	}{
+		{"basic", from(""), ReasonBasePrice, 900, "usd", false},
+		{"pro", inTest("exp_A", "var_3", ""), ReasonExperiment, 3900, "usd", false},
+		{"pro", PriceRequest{UserAgent: "curl/8.4.0"}, ReasonBot, 2400, "usd", false},
+		{"geo", from("BR"), ReasonBasePrice, 2000, "usd", true},
+		{"geo", from("IN"), ReasonBasePrice, 99_900, "inr", true},
+		{"geox", inTest("exp_G", "var_g1", "IN"), ReasonExperiment, 64_900, "inr", true},
+	}
+	limits := []struct {
+		name               string
+		minPrice, maxPrice int64
+	}{
+		{"narrower than the signed range", 2500, 2600},
+		{"MinPrice above MaxPrice", 5000, 100},
+		{"negative", -5000, -100},
+		{"beyond 2^53-1", math.MinInt64, math.MaxInt64},
+	}
+	for _, l := range limits {
+		h := newHarness(t, func(o *Options) {
+			o.LocalCurrencies = true
+			for key, g := range o.Products {
+				o.Products[key] = ProductGuard{Currency: g.Currency, FallbackPrice: g.FallbackPrice, MinPrice: l.minPrice, MaxPrice: l.maxPrice}
+			}
+		})
+		for _, tc := range quotes {
+			q := h.price(t, tc.productKey, tc.req)
+			if q.IsFallback || q.Reason != tc.reason || q.Price != tc.price || q.Currency != tc.currency || q.Regional != tc.regional {
+				t.Errorf("%s: %s: %+v", l.name, tc.productKey, q)
+			}
+		}
+		if errs := h.errs.unexpected(); len(errs) > 0 {
+			t.Errorf("%s: errors %q", l.name, errs)
+		}
+	}
+}
+
+func TestConfigRegions(t *testing.T) {
+	const regions = `[{"countries":["BR","MX"],"currency":"usd","price":2000},{"countries":["IN"],"currency":"INR","price":99900}]`
+	experiment := func(first, second string) string {
+		return `{"id":"exp_1","salt":"s","variants":[{"id":"var_1","price":1900,"weight":5000` + first +
+			`},{"id":"var_2","price":3900,"weight":5000` + second + `}]}`
+	}
+	distinct := func(n int) string {
+		list := make([]string, n)
+		for i := range list {
+			list[i] = fmt.Sprintf(`{"countries":["%c%c"],"currency":"inr","price":1}`, 'A'+i/26, 'A'+i%26)
+		}
+		return "[" + strings.Join(list, ",") + "]"
+	}
+	products := []struct {
+		key   string
+		body  string
+		valid bool
+	}{
+		{"flat", `"regions":[]`, true},
+		{"none", `"regions":null`, true},
+		{"geo", `"regions":` + regions, true},
+		{"test", `"regions":` + regions + `,"experiment":` + experiment(`,"regional":[1300,64900]`, `,"regional":[2700,129900]`), true},
+		{"ignored", `"experiment":` + experiment(`,"regional":[1]`, `,"regional":"junk"`), true},
+		{"limit", `"regions":` + distinct(maxRegions), true},
+		{"over", `"regions":` + distinct(maxRegions+1), false},
+		{"twice", `"regions":[{"countries":["IN"],"currency":"inr","price":1},{"countries":["BR","IN"],"currency":"usd","price":1}]`, false},
+		{"repeated", `"regions":[{"countries":["IN","IN"],"currency":"inr","price":1}]`, false},
+		{"lower", `"regions":[{"countries":["in"],"currency":"inr","price":1}]`, false},
+		{"empty", `"regions":[{"countries":[],"currency":"inr","price":1}]`, false},
+		{"free", `"regions":[{"countries":["IN"],"currency":"inr","price":0}]`, false},
+		{"fraction", `"regions":[{"countries":["IN"],"currency":"inr","price":1.5}]`, false},
+		{"money", `"regions":[{"countries":["IN"],"currency":"rupee","price":1}]`, false},
+		{"shape", `"regions":{"IN":1}`, false},
+		{"short", `"regions":` + regions + `,"experiment":` + experiment(`,"regional":[1300]`, `,"regional":[2700,129900]`), false},
+		{"long", `"regions":` + regions + `,"experiment":` + experiment(`,"regional":[1300,64900,1]`, `,"regional":[2700,129900]`), false},
+		{"missing", `"regions":` + regions + `,"experiment":` + experiment(`,"regional":[1300,64900]`, ``), false},
+		{"zero", `"regions":` + regions + `,"experiment":` + experiment(`,"regional":[1300,0]`, `,"regional":[2700,129900]`), false},
+	}
+	entries := make([]string, len(products))
+	var invalid []string
+	for i, p := range products {
+		entries[i] = fmt.Sprintf(`%q:{"currency":"USD","price":1900,"minPrice":1500,"maxPrice":3900,%s}`, p.key, p.body)
+		if !p.valid {
+			invalid = append(invalid, p.key)
+		}
+	}
+	payload := `{"schema":2,"projectId":"proj_1","version":1,"expiresAt":1,"keyFingerprints":[],"assignmentKey":"` +
+		vectors(t).AssignmentKey + `","products":{` + strings.Join(entries, ",") + `}}`
+	cfg, dropped, err := parseConfig(b64url([]byte(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(dropped, invalid) {
+		t.Fatalf("dropped %q, want %q", dropped, invalid)
+	}
+
+	if flat := cfg.products["flat"]; len(flat.regions) != 0 || len(flat.regionOf) != 0 {
+		t.Errorf("product without regions: %+v", flat)
+	}
+	geo := cfg.products["geo"]
+	if want := []region{{0, "usd", 2000}, {1, "inr", 99_900}}; !slices.Equal(geo.regions, want) {
+		t.Errorf("regions %+v, want %+v", geo.regions, want)
+	}
+	if want := map[string]int{"BR": 0, "MX": 0, "IN": 1}; !reflect.DeepEqual(geo.regionOf, want) {
+		t.Errorf("regionOf %v, want %v", geo.regionOf, want)
+	}
+	for i, want := range [][]int64{{1300, 64_900}, {2700, 129_900}} {
+		if got := cfg.products["test"].experiment.variants[i].regional; !slices.Equal(got, want) {
+			t.Errorf("variant %d: regional %v, want %v", i, got, want)
+		}
+	}
+	for i, v := range cfg.products["ignored"].experiment.variants {
+		if len(v.regional) != 0 {
+			t.Errorf("variant %d of a product without regions: regional %v", i, v.regional)
+		}
+	}
+}
+
+func TestConfigCountryHeader(t *testing.T) {
+	cases := []struct{ member, want string }{
+		{`"countryHeader":"X-Geo-Country",`, "x-geo-country"},
+		{`"countryHeader":"cf-ipcountry",`, "cf-ipcountry"},
+		{``, ""},
+		{`"countryHeader":null,`, ""},
+		{`"countryHeader":42,`, ""},
+		{`"countryHeader":true,`, ""},
+		{`"countryHeader":["x-geo-country"],`, ""},
+		{`"countryHeader":{"name":"x-geo-country"},`, ""},
+		{`"countryHeader":"",`, ""},
+		{`"countryHeader":"cf ipcountry",`, ""},
+		{`"countryHeader":" x-geo-country",`, ""},
+		{`"countryHeader":"x-geo-country\n",`, ""},
+		{`"countryHeader":"x-\u212aountry",`, ""},
+	}
+	for _, tc := range cases {
+		payload := `{"schema":2,"projectId":"proj_1","version":1,"expiresAt":1,"keyFingerprints":[],"assignmentKey":"` +
+			vectors(t).AssignmentKey + `",` + tc.member + `"products":{}}`
+		cfg, _, err := parseConfig(b64url([]byte(payload)))
+		if err != nil {
+			t.Errorf("config with %q rejected: %v", tc.member, err)
+			continue
+		}
+		if cfg.countryHeader != tc.want {
+			t.Errorf("config with %q: country header %q, want %q", tc.member, cfg.countryHeader, tc.want)
+		}
+	}
+}
+
+func TestConfigTestsByCountry(t *testing.T) {
+	test := func(members string) string {
+		return `{"id":"exp_1","salt":"s","variants":[{"id":"var_1","price":1900,"weight":5000},` +
+			`{"id":"var_2","price":3900,"weight":5000}]` + members + `}`
+	}
+	open := func(splits string) string { return `"experiment":` + test(`,"splits":`+splits) }
+	scoped := func(countries string) string { return `"scopedExperiment":` + test(`,"countries":`+countries) }
+	split := func(countries, weights string) string {
+		return `{"countries":` + countries + `,"weights":` + weights + `}`
+	}
+	codes := func(n int) []string {
+		list := make([]string, n)
+		for i := range list {
+			list[i] = fmt.Sprintf(`"%c%c"`, 'A'+i/26, 'A'+i%26)
+		}
+		return list
+	}
+	countries := func(n int) string { return "[" + strings.Join(codes(n), ",") + "]" }
+	splits := func(n int) string {
+		list := codes(n)
+		for i, code := range list {
+			list[i] = split("["+code+"]", "[2500,7500]")
+		}
+		return "[" + strings.Join(list, ",") + "]"
+	}
+
+	valid := map[string]string{
+		"open":         `"experiment":` + test(`,"countries":"ignored"`) + `,"scopedExperiment":null`,
+		"scoped":       `"experiment":null,` + scoped(`["IN","BR"]`),
+		"scope limit":  scoped(countries(maxScope)),
+		"split":        open(`[` + split(`["IN","BR"]`, `[10000,0]`) + `,` + split(`["DE"]`, `[2500.0,9007199254740991]`) + `]`),
+		"no splits":    open(`null`),
+		"empty splits": open(`[]`),
+		"splits limit": open(splits(maxSplits)),
+		"scoped split": scoped(`["IN"],"splits":[` + split(`["US"]`, `[0,10000]`) + `]`),
+	}
+	invalid := []string{
+		`"experiment":` + test(``) + `,` + scoped(`["IN"]`),
+		`"scopedExperiment":` + test(``),
+		`"scopedExperiment":[]`,
+		`"scopedExperiment":{"id":"exp_1","salt":"s","countries":["IN"],"variants":[{"id":"var_1","price":1900,"weight":-1}]}`,
+		scoped(countries(maxScope + 1)),
+		scoped(`["IN","BR","IN"]`),
+		scoped(`["IN"],"splits":[` + split(`["IN"]`, `[10000]`) + `]`),
+		open(splits(maxSplits + 1)),
+		open(`{}`),
+		open(`["IN"]`),
+		open(`[{"weights":[5000,5000]}]`),
+		open(`[{"countries":["IN"]}]`),
+		open(`[` + split(`["IN"]`, `[5000,5000]`) + `,` + split(`["BR","IN"]`, `[10000,0]`) + `]`),
+		open(`[` + split(`["IN","IN"]`, `[5000,5000]`) + `]`),
+	}
+	for _, list := range []string{`null`, `[]`, `"IN"`, `["in"]`, `["IND"]`, `[1]`, `["\u212aN"]`} {
+		invalid = append(invalid, scoped(list), open(`[`+split(list, `[5000,5000]`)+`]`))
+	}
+	for _, weights := range []string{`null`, `"5000,5000"`, `[10000]`, `[5000,2500,2500]`, `[10001,-1]`, `[0.5,9999.5]`,
+		`[9007199254740992,0]`, `[true,0]`, `["5000",5000]`} {
+		invalid = append(invalid, open(`[`+split(`["IN"]`, weights)+`]`))
+	}
+
+	product := func(key, body string) string {
+		return fmt.Sprintf(`%q:{"currency":"usd","price":2900,"minPrice":1900,"maxPrice":4900,%s}`, key, body)
+	}
+	entries := make([]string, 0, len(valid)+len(invalid))
+	for key, body := range valid {
+		entries = append(entries, product(key, body))
+	}
+	for i, body := range invalid {
+		entries = append(entries, product(fmt.Sprintf("invalid %d", i), body))
+	}
+	payload := `{"schema":2,"projectId":"proj_1","version":1,"expiresAt":1,"keyFingerprints":[],"assignmentKey":"` +
+		vectors(t).AssignmentKey + `","products":{` + strings.Join(entries, ",") + `}}`
+	cfg, _, err := parseConfig(b64url([]byte(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := range valid {
+		if cfg.products[key] == nil {
+			t.Fatalf("dropped the valid product %q", key)
+		}
+	}
+	for i, body := range invalid {
+		if cfg.products[fmt.Sprintf("invalid %d", i)] != nil {
+			t.Errorf("kept a product with %s", body)
+		}
+	}
+
+	type set = map[string]struct{}
+	type weights = map[string][]float64
+	if got := cfg.products["open"].experiment.scope; got != nil {
+		t.Errorf("an open test has the scope %v", got)
+	}
+	if got := cfg.products["scoped"].experiment.scope; !reflect.DeepEqual(got, set{"IN": {}, "BR": {}}) {
+		t.Errorf("scope %v, want IN and BR", got)
+	}
+	if n := len(cfg.products["scope limit"].experiment.scope); n != maxScope {
+		t.Errorf("scope of %d countries, want %d", n, maxScope)
+	}
+	splitOf := cfg.products["split"].experiment.splitOf
+	if want := (weights{"IN": {10000, 0}, "BR": {10000, 0}, "DE": {2500, maxSafeInteger}}); !reflect.DeepEqual(splitOf, want) {
+		t.Errorf("splits %v, want %v", splitOf, want)
+	}
+	for _, key := range []string{"open", "no splits", "empty splits"} {
+		if n := len(cfg.products[key].experiment.splitOf); n != 0 {
+			t.Errorf("%s: %d countries with a split, want none", key, n)
+		}
+	}
+	if n := len(cfg.products["splits limit"].experiment.splitOf); n != maxSplits {
+		t.Errorf("%d countries with a split, want %d", n, maxSplits)
+	}
+	exp := cfg.products["scoped split"].experiment
+	if !reflect.DeepEqual(exp.scope, set{"IN": {}}) || !reflect.DeepEqual(exp.splitOf, weights{"US": {0, 10000}}) {
+		t.Errorf("scoped test with a split: scope %v, splits %v", exp.scope, exp.splitOf)
+	}
+}
+
+func TestScopedTestLeavesVisitorsOutsideItsScopeAlone(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.Products["local"] = ProductGuard{Currency: "usd", FallbackPrice: 2900} })
+	assigned := "__pp=" + cookieFor(t, vectorState{V: returningVisitor.V, A: [][2]string{{"exp_L", "var_l2"}}, X: []string{}})
+	for _, country := range []string{"US", "MX", ""} {
+		for _, cookie := range []string{"", assigned} {
+			req := browser(cookie)
+			req.Country = country
+			q := h.price(t, "local", req)
+			if q.Reason != ReasonBasePrice || q.Country != country || q.VisitorID != "" || len(q.SetCookie) != 0 || q.ExposureLogged {
+				t.Errorf("visitor from %q with the cookie %q: %+v", country, cookie, q)
+			}
+		}
+	}
+	h.c.Flush(context.Background())
+	if events := h.api.sentEvents(t); len(events) != 0 {
+		t.Errorf("exposures outside the scope: %v", events)
+	}
+
+	req := browser(assigned)
+	req.Country = "IN"
+	if q := h.price(t, "local", req); q.Reason != ReasonExperiment || q.VariantID != "var_l2" || !q.ExposureLogged {
+		t.Errorf("back inside the scope: %+v", q)
+	}
+}
+
+func TestSplitReplacesTheWeights(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.Products["split"] = ProductGuard{Currency: "usd", FallbackPrice: 2900} })
+	split := map[string]string{"IN": "var_s3", "BR": "var_s3", "DE": "var_s2", "FR": "var_s1"}
+	own := map[string]int{}
+	for i := 0; i < 20; i++ {
+		req := PriceRequest{UserAgent: chrome, UserID: fmt.Sprintf("user_%d", i)}
+		for country, variantID := range split {
+			req.Country = country
+			if q := h.price(t, "split", req); q.VariantID != variantID {
+				t.Errorf("user_%d from %s: %s, want %s", i, country, q.VariantID, variantID)
+			}
+		}
+		for _, country := range []string{"US", ""} {
+			req.Country = country
+			own[h.price(t, "split", req).VariantID]++
+		}
+	}
+	if len(own) != 2 || own["var_s1"] == 0 || own["var_s2"] == 0 {
+		t.Errorf("visitors from a country without a split: %v, want var_s1 and var_s2 only", own)
+	}
+}
+
+func TestStickyAssignmentBeatsASplit(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.Products["split"] = ProductGuard{Currency: "usd", FallbackPrice: 2900} })
+	req := browser("__pp=" + cookieFor(t, vectorState{V: returningVisitor.V, A: [][2]string{{"exp_S", "var_s1"}}, X: []string{"exp_S"}}))
+	req.Country = "IN"
+	if q := h.price(t, "split", req); q.Reason != ReasonExperiment || q.VariantID != "var_s1" || len(q.SetCookie) != 0 {
+		t.Errorf("assigned visitor from IN: %+v", q)
+	}
+	req = browser("")
+	req.Country = "IN"
+	if q := h.price(t, "split", req); q.VariantID != "var_s3" {
+		t.Errorf("new visitor from IN: %s, want var_s3", q.VariantID)
 	}
 }

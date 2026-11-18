@@ -13,13 +13,11 @@ type requestInfo struct {
 	pinned            bool
 	userAgent         string
 	prefetch          bool
+	country           string
 }
 
-func readRequest(pr *PriceRequest, cookieName string) requestInfo {
-	h := pr.Header
-	if h == nil && pr.Request != nil {
-		h = pr.Request.Header
-	}
+func readRequest(pr *PriceRequest, cookieName, countryHeader string) requestInfo {
+	h := requestHeader(pr)
 	var info requestInfo
 	if pr.Cookie != "" {
 		info.cookieInput = pr.Cookie
@@ -40,7 +38,41 @@ func readRequest(pr *PriceRequest, cookieName string) requestInfo {
 		info.userAgent, _ = headerValue(h, "user-agent")
 	}
 	info.prefetch = isPrefetch(h)
+	switch {
+	case pr.Country != "":
+		info.country = normalizeCountry(pr.Country)
+	case countryHeader != "":
+		info.country = headerCountry(h, countryHeader)
+	}
 	return info
+}
+
+func requestHeader(pr *PriceRequest) http.Header {
+	if pr.Header == nil && pr.Request != nil {
+		return pr.Request.Header
+	}
+	return pr.Header
+}
+
+func headerCountry(h http.Header, name string) string {
+	value, _ := headerValue(h, name)
+	return normalizeCountry(value)
+}
+
+// normalizeCountry returns the ISO 3166-1 alpha-2 code in value, or "" for anything else,
+// including what CDNs send for an unknown location, Tor, anonymous proxies and regions. It reads
+// ASCII bytes only: Unicode trimming or case mapping would turn other input into a country.
+func normalizeCountry(value string) string {
+	code := trimASCIISpace(value)
+	if len(code) != 2 || !isASCIILetter(code[0]) || !isASCIILetter(code[1]) {
+		return ""
+	}
+	code = string([]byte{code[0] &^ 0x20, code[1] &^ 0x20})
+	switch code {
+	case "XX", "ZZ", "T1", "A1", "A2", "AP", "EU":
+		return ""
+	}
+	return code
 }
 
 func headerValue(h http.Header, name string) (string, bool) {
@@ -49,8 +81,9 @@ func headerValue(h http.Header, name string) (string, bool) {
 	}
 	values, ok := h[http.CanonicalHeaderKey(name)]
 	if !ok {
+		lower := asciiLower(name)
 		for k, v := range h {
-			if strings.EqualFold(k, name) {
+			if asciiLower(k) == lower {
 				values, ok = v, true
 				break
 			}
@@ -91,7 +124,7 @@ func cookieValues(header, name string) []string {
 }
 
 func isPrefetch(h http.Header) bool {
-	for _, name := range [...]string{"sec-purpose", "purpose", "x-purpose", "x-moz"} {
+	for _, name := range [...]string{"sec-purpose", "x-sec-purpose", "purpose", "x-purpose", "x-moz"} {
 		if v, ok := headerValue(h, name); ok {
 			v = asciiLower(v)
 			if strings.Contains(v, "prefetch") || strings.Contains(v, "prerender") || strings.Contains(v, "preview") {

@@ -11,22 +11,24 @@ type Reason string
 // Quote reasons.
 const (
 	ReasonExperiment       Reason = "experiment"        // the visitor's sticky experiment variant
-	ReasonBasePrice        Reason = "base_price"        // the standard price; no experiment running
+	ReasonBasePrice        Reason = "base_price"        // the product's price; no experiment runs for this visitor
 	ReasonBot              Reason = "bot"               // standard price, or fallback; never enrolled
 	ReasonDisabled         Reason = "disabled"          // kill switch, or no valid secret key
 	ReasonNoConfig         Reason = "no_config"         // no usable signed config; sets the pin cookie
 	ReasonPinnedFallback   Reason = "pinned_fallback"   // this browser got a fallback during an outage
 	ReasonUnknownProduct   Reason = "unknown_product"   // the config has no such product
 	ReasonCurrencyMismatch Reason = "currency_mismatch" // the config's currency differs from the guard
-	ReasonOutOfBounds      Reason = "out_of_bounds"     // a price is outside the guard or config bounds
+	ReasonOutOfBounds      Reason = "out_of_bounds"     // a price is outside the product's signed range
 )
 
-// Quote is the price to show and charge for one product. ExperimentID, VariantID, VisitorID and
-// CheckoutURL are empty when unset and encode as JSON null.
+// Quote is the price to show and charge for one product. Country, ExperimentID, VariantID,
+// VisitorID and CheckoutURL are empty when unset and encode as JSON null.
 type Quote struct {
 	ProductKey     string            `json:"productKey"`
 	Price          int64             `json:"price"`
-	Currency       string            `json:"currency"`
+	Currency       string            `json:"currency"` // the product's currency, or the region's when Regional
+	Country        string            `json:"country"`  // the visitor's country (ISO 3166-1 alpha-2), when known
+	Regional       bool              `json:"regional"` // Price is the regional price of Country
 	IsFallback     bool              `json:"isFallback"`
 	Reason         Reason            `json:"reason"`
 	ExperimentID   string            `json:"experimentId"`
@@ -61,6 +63,8 @@ func (q Quote) MarshalJSON() ([]byte, error) {
 		ProductKey     string            `json:"productKey"`
 		Price          int64             `json:"price"`
 		Currency       string            `json:"currency"`
+		Country        *string           `json:"country"`
+		Regional       bool              `json:"regional"`
 		IsFallback     bool              `json:"isFallback"`
 		Reason         Reason            `json:"reason"`
 		ExperimentID   *string           `json:"experimentId"`
@@ -75,6 +79,8 @@ func (q Quote) MarshalJSON() ([]byte, error) {
 		ProductKey:     q.ProductKey,
 		Price:          q.Price,
 		Currency:       q.Currency,
+		Country:        nullable(q.Country),
+		Regional:       q.Regional,
 		IsFallback:     q.IsFallback,
 		Reason:         q.Reason,
 		ExperimentID:   nullable(q.ExperimentID),
@@ -121,5 +127,15 @@ func priceQuote(productKey string, g guard, price int64, reason Reason, checkout
 	q.Price = price
 	q.IsFallback = false
 	q.CheckoutURL = checkoutURL
+	return q
+}
+
+// regionalQuote carries no checkout URL: hosted checkout links are made for the standard prices.
+func regionalQuote(productKey string, g guard, r *region) *Quote {
+	q := fallbackQuote(productKey, g, ReasonBasePrice)
+	q.Price = r.price
+	q.Currency = r.currency
+	q.Regional = true
+	q.IsFallback = false
 	return q
 }

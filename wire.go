@@ -11,6 +11,9 @@ const (
 	configVersionHeader = "Leverprice-Config-Version"
 	maxEventsPerRequest = 500
 	maxMinorUnits       = 10_000_000_000
+	maxRegions          = 300
+	maxSplits           = 300
+	maxScope            = 300
 )
 
 type keyset struct {
@@ -25,12 +28,25 @@ type variant struct {
 	price       int64
 	weight      float64
 	checkoutURL string
+	regional    []int64
 }
 
+// experiment is the one test of a product. A nil scope opens it to every visitor; otherwise it
+// runs only for visitors from those countries. splitOf maps a country to the weights its visitors
+// are split by, one per variant, in place of the variants' own.
 type experiment struct {
 	id       string
 	salt     string
 	variants []variant
+	scope    map[string]struct{}
+	splitOf  map[string][]float64
+}
+
+// region is one regional price of a product; index also selects each variant's regional price.
+type region struct {
+	index    int
+	currency string
+	price    int64
 }
 
 type configProduct struct {
@@ -39,6 +55,8 @@ type configProduct struct {
 	minPrice    int64
 	maxPrice    int64
 	checkoutURL string
+	regions     []region
+	regionOf    map[string]int
 	experiment  *experiment
 }
 
@@ -49,6 +67,7 @@ type config struct {
 	assignmentKey   string
 	key             []byte
 	keyFingerprints []string
+	countryHeader   string
 	products        map[string]*configProduct
 }
 
@@ -95,6 +114,10 @@ func parseConfig(payload string) (*config, []string, error) {
 	if err != nil || len(key) < 32 {
 		return nil, nil, errors.New("leverprice config: assignmentKey must be at least 32 bytes of base64url")
 	}
+	countryHeader, _ := jsonString(obj["countryHeader"])
+	if !isToken(countryHeader) {
+		countryHeader = ""
+	}
 	members, ok := jsonOrderedObject(obj["products"])
 	if !ok {
 		return nil, nil, errors.New("leverprice config: no products")
@@ -115,6 +138,7 @@ func parseConfig(payload string) (*config, []string, error) {
 		assignmentKey:   assignmentKey,
 		key:             key,
 		keyFingerprints: fingerprints,
+		countryHeader:   asciiLower(countryHeader),
 		products:        products,
 	}, dropped, nil
 }
@@ -135,8 +159,21 @@ func parseProduct(raw json.RawMessage) *configProduct {
 		return nil
 	}
 	out := &configProduct{currency: asciiLower(currency), price: price, minPrice: minPrice, maxPrice: maxPrice}
+	if r, present := p["regions"]; present && !isJSONNull(r) {
+		if out.regions, out.regionOf, ok = parseRegions(r); !ok {
+			return nil
+		}
+	}
 	if e, present := p["experiment"]; present && !isJSONNull(e) {
-		if out.experiment = parseExperiment(e); out.experiment == nil {
+		if out.experiment = parseExperiment(e, len(out.regions), false); out.experiment == nil {
+			return nil
+		}
+	}
+	if e, present := p["scopedExperiment"]; present && !isJSONNull(e) {
+		if out.experiment != nil {
+			return nil
+		}
+		if out.experiment = parseExperiment(e, len(out.regions), true); out.experiment == nil {
 			return nil
 		}
 	}
@@ -145,7 +182,73 @@ func parseProduct(raw json.RawMessage) *configProduct {
 	return out
 }
 
-func parseExperiment(raw json.RawMessage) *experiment {
+// parseRegions rejects a country listed twice: a visitor has at most one regional price.
+func parseRegions(raw json.RawMessage) ([]region, map[string]int, bool) {
+	list, ok := jsonArray(raw)
+	if !ok || len(list) > maxRegions {
+		return nil, nil, false
+	}
+	regions := make([]region, 0, len(list))
+	regionOf := make(map[string]int)
+	for i, item := range list {
+		r, ok := jsonObject(item)
+		if !ok {
+			return nil, nil, false
+		}
+		countries, ok := parseCountries(r["countries"])
+		if !ok {
+			return nil, nil, false
+		}
+		for _, country := range countries {
+			if _, listed := regionOf[country]; listed {
+				return nil, nil, false
+			}
+			regionOf[country] = i
+		}
+		currency, ok1 := jsonString(r["currency"])
+		price, ok2 := jsonSafeInt(r["price"])
+		if !ok1 || !isCurrencyCode(currency) || !ok2 || price <= 0 {
+			return nil, nil, false
+		}
+		regions = append(regions, region{index: i, currency: asciiLower(currency), price: price})
+	}
+	return regions, regionOf, true
+}
+
+// parseCountries reads a non-empty list of country codes.
+func parseCountries(raw json.RawMessage) ([]string, bool) {
+	list, ok := jsonArray(raw)
+	if !ok || len(list) == 0 {
+		return nil, false
+	}
+	countries := make([]string, len(list))
+	for i, item := range list {
+		if countries[i], ok = jsonString(item); !ok || !isCountryCode(countries[i]) {
+			return nil, false
+		}
+	}
+	return countries, true
+}
+
+// parseRegional reads a variant's prices: exactly one per region of its product, in order.
+func parseRegional(raw json.RawMessage, regions int) ([]int64, bool) {
+	list, ok := jsonArray(raw)
+	if !ok || len(list) != regions {
+		return nil, false
+	}
+	prices := make([]int64, len(list))
+	for i, item := range list {
+		price, ok := jsonSafeInt(item)
+		if !ok || price <= 0 {
+			return nil, false
+		}
+		prices[i] = price
+	}
+	return prices, true
+}
+
+// parseExperiment reads a test. A scoped one also lists the countries it runs in.
+func parseExperiment(raw json.RawMessage, regions int, scoped bool) *experiment {
 	e, ok := jsonObject(raw)
 	if !ok {
 		return nil
@@ -164,14 +267,96 @@ func parseExperiment(raw json.RawMessage) *experiment {
 		}
 		vid, ok1 := jsonString(v["id"])
 		price, ok2 := jsonSafeInt(v["price"])
-		weight, ok3 := jsonSafeInt(v["weight"])
-		if !ok1 || !isID(vid) || !ok2 || !ok3 || weight < 0 {
+		weight, ok3 := parseWeight(v["weight"])
+		if !ok1 || !isID(vid) || !ok2 || !ok3 {
 			return nil
 		}
+		var regional []int64
+		if regions > 0 {
+			if regional, ok = parseRegional(v["regional"], regions); !ok {
+				return nil
+			}
+		}
 		url, _ := jsonString(v["checkoutUrl"])
-		exp.variants = append(exp.variants, variant{id: vid, price: price, weight: float64(weight), checkoutURL: httpsURL(url)})
+		exp.variants = append(exp.variants, variant{
+			id:          vid,
+			price:       price,
+			weight:      weight,
+			checkoutURL: httpsURL(url),
+			regional:    regional,
+		})
+	}
+	if s, present := e["splits"]; present && !isJSONNull(s) {
+		if exp.splitOf, ok = parseSplits(s, len(exp.variants)); !ok {
+			return nil
+		}
+	}
+	if scoped {
+		if exp.scope, ok = parseScope(e["countries"]); !ok {
+			return nil
+		}
 	}
 	return exp
+}
+
+func parseWeight(raw json.RawMessage) (float64, bool) {
+	weight, ok := jsonSafeInt(raw)
+	return float64(weight), ok && weight >= 0
+}
+
+// parseSplits rejects a country listed twice: its visitors are split one way.
+func parseSplits(raw json.RawMessage, variants int) (map[string][]float64, bool) {
+	list, ok := jsonArray(raw)
+	if !ok || len(list) > maxSplits {
+		return nil, false
+	}
+	splitOf := make(map[string][]float64)
+	for _, item := range list {
+		s, ok := jsonObject(item)
+		if !ok {
+			return nil, false
+		}
+		countries, ok1 := parseCountries(s["countries"])
+		weights, ok2 := parseWeights(s["weights"], variants)
+		if !ok1 || !ok2 {
+			return nil, false
+		}
+		for _, country := range countries {
+			if _, listed := splitOf[country]; listed {
+				return nil, false
+			}
+			splitOf[country] = weights
+		}
+	}
+	return splitOf, true
+}
+
+// parseWeights reads a split's weights: exactly one per variant of its test, in order.
+func parseWeights(raw json.RawMessage, variants int) ([]float64, bool) {
+	list, ok := jsonArray(raw)
+	if !ok || len(list) != variants {
+		return nil, false
+	}
+	weights := make([]float64, len(list))
+	for i, item := range list {
+		if weights[i], ok = parseWeight(item); !ok {
+			return nil, false
+		}
+	}
+	return weights, true
+}
+
+// parseScope reads the countries a scoped test runs in, each listed once.
+func parseScope(raw json.RawMessage) (map[string]struct{}, bool) {
+	countries, ok := parseCountries(raw)
+	if !ok || len(countries) > maxScope {
+		return nil, false
+	}
+	set := make(map[string]struct{}, len(countries))
+	for _, country := range countries {
+		set[country] = struct{}{}
+	}
+	return set, len(set) == len(countries)
 }
 
 func jsonText(raw json.RawMessage) string {
@@ -194,6 +379,7 @@ type exposureEvent struct {
 	VariantID    string `json:"variantId"`
 	VisitorID    string `json:"visitorId"`
 	Timestamp    int64  `json:"timestamp"`
+	Country      string `json:"country,omitempty"`
 }
 
 type wireAttribution struct {
@@ -257,6 +443,9 @@ func eventProblem(e wireEvent) string {
 		if !isID(e.ExperimentID) || !isID(e.VariantID) || !isID(e.VisitorID) {
 			return "invalid experiment/variant/visitor id"
 		}
+		if e.Country != "" && !isCountryCode(e.Country) {
+			return "country must be an ISO 3166-1 alpha-2 code"
+		}
 	case purchaseEvent:
 		if !validTimestamp(e.Timestamp) {
 			return "timestamp must be a positive integer (ms)"
@@ -298,7 +487,7 @@ func eventProblem(e wireEvent) string {
 
 func moneyProblem(provider Provider, orderID, currency string) string {
 	switch provider {
-	case ProviderStripe, ProviderPolar, ProviderLemonSqueezy, ProviderDodo, ProviderOther:
+	case ProviderStripe, ProviderPolar, ProviderLemonSqueezy, ProviderDodo, ProviderPaddle, ProviderCreem, ProviderOther:
 	default:
 		return fmt.Sprintf("unknown provider %q", string(provider))
 	}
